@@ -80,7 +80,35 @@ def get_short_status(status_code, description):
         return "In Customs"
     elif "departed" in desc_lower or "arrived" in desc_lower:
         return "In Transit"
+    elif "delay" in desc_lower:
+        return "Delayed"
+    elif "attempt" in desc_lower:
+        return "Delivery Attempted"
+    elif "return" in desc_lower:
+        return "Returned to Sender"
     return description[:20] if description else "Unknown"
+
+def translate_status_to_spanish(english_status):
+    """Translate FedEx status to SonIA Spanish status"""
+    status_translations = {
+        "Label Created": "Guia creada, FedEx no tiene el paquete",
+        "Picked Up": "FedEx recibio el paquete",
+        "In Transit": "En movimiento",
+        "Out for Delivery": "Sale hoy a reparto",
+        "Delivered": "Entregado",
+        "Delivery Attempted": "Intento fallido",
+        "Delivery Exception": "Incidencia",
+        "Exception": "Incidencia",
+        "Shipment Exception": "Incidencia",
+        "On Hold": "Incidencia",
+        "Hold at Location": "Incidencia",
+        "Delayed": "Retraso operativo",
+        "Returned to Sender": "En devolucion",
+        "Return to Shipper": "En devolucion",
+        "Cancelled": "Envio anulado",
+        "In Customs": "En movimiento",
+    }
+    return status_translations.get(english_status, english_status)
 
 def calculate_working_days(start_date, end_date):
     working_days = 0
@@ -163,7 +191,7 @@ def generate_sonia_analysis(track_data, status, is_delivered, delivery_date, shi
     return history_summary, recommendation
 
 def parse_tracking_response(response, tracking_number):
-    result = {"tracking_number": tracking_number, "status": "Unknown", "history_summary": "", "sonia_recommendation": "", "label_creation_date": "", "ship_date": "", "delivery_date": "", "days_after_shipment": 0, "working_days_after_shipment": 0, "days_after_label_creation": 0, "destination_location": "", "is_delivered": False}
+    result = {"tracking_number": tracking_number, "status": "Unknown", "sonia_status": "Desconocido", "history_summary": "", "sonia_recommendation": "", "label_creation_date": "", "ship_date": "", "delivery_date": "", "days_after_shipment": 0, "working_days_after_shipment": 0, "days_after_label_creation": 0, "destination_location": "", "is_delivered": False}
     try:
         if response and "output" in response:
             complete_track = response["output"].get("completeTrackResults", [])
@@ -175,6 +203,7 @@ def parse_tracking_response(response, tracking_number):
                     status_code = latest_status.get("code", "")
                     status_desc = latest_status.get("description", "")
                     result["status"] = get_short_status(status_code, status_desc)
+                    result["sonia_status"] = translate_status_to_spanish(result["status"])
                     result["is_delivered"] = "delivered" in result["status"].lower()
                     date_times = track_data.get("dateAndTimes", [])
                     for dt in date_times:
@@ -357,8 +386,8 @@ async def process_file(file: UploadFile = File(...)):
         if not results:
             return JSONResponse({"success": False, "error": "No se encontraron numeros de tracking validos"})
         output_df = pd.DataFrame(results)
-        output_df = output_df[["client_name", "tracking_number", "status", "label_creation_date", "ship_date", "days_after_shipment", "working_days_after_shipment", "days_after_label_creation", "destination_location", "history_summary", "sonia_recommendation"]]
-        output_df.columns = ["Nombre Cliente", "FEDEX Tracking", "Status", "Label Creation Date", "Shipping Date", "Days After Shipment", "Working Days After Shipment", "Days After Label Creation", "Destination City/State/Country", "Historial", "SonIA Recomendacion"]
+        output_df = output_df[["client_name", "tracking_number", "sonia_status", "status", "label_creation_date", "ship_date", "days_after_shipment", "working_days_after_shipment", "days_after_label_creation", "destination_location", "history_summary", "sonia_recommendation"]]
+        output_df.columns = ["Nombre Cliente", "FEDEX Tracking", "SonIA status", "FedEx status", "Label Creation Date", "Shipping Date", "Days After Shipment", "Working Days After Shipment", "Days After Label Creation", "Destination City/State/Country", "Historial", "SonIA Recomendacion"]
         output = BytesIO()
         output_df.to_excel(output, index=False)
         output.seek(0)
