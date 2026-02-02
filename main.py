@@ -58,90 +58,91 @@ class FedExClient:
                 return None
 
 def get_short_status(status_code, description):
-    """Convert FedEx status to normalized SonIA status"""
-    # Map FedEx status codes to normalized values
-    status_mapping = {
-        "PU": "Picked Up",
-        "IT": "In Transit",
-        "DL": "Delivered",
-        "DE": "Delivery Exception",
-        "OD": "Out for Delivery",
-        "HL": "Hold at Location",
-        "SE": "Shipment Exception",
-        "CA": "Cancelled",
-        "RS": "Return to Shipper",
-        "IN": "Label Created",
-        "INITIATED": "Label Created",
-        "AA": "In Transit",
-        "AR": "In Transit",
-        "DP": "In Transit",
-        "AF": "In Transit",
-        "OC": "Shipment Exception",
-        "CD": "Clearance Delay",
-        "SP": "Label Created",
-        "PL": "Label Created",
-        "PM": "In Transit"
-    }
-
-    # Check status code first
-    if status_code:
-        code_upper = status_code.upper()
-        if code_upper in status_mapping:
-            return status_mapping[code_upper]
-
-    # Check description for keywords
+    """
+    Convert FedEx status to normalized SonIA status.
+    IMPORTANT: Check description FIRST before status code.
+    """
     desc_lower = description.lower() if description else ""
 
-    # Label Created variations
-    if any(x in desc_lower for x in ["shipment information sent", "label created", "shipping label",
-                                      "shipment information received", "electronic shipment information",
-                                      "initiated", "created"]):
+    # PRIORITY 1: Check description first for specific phrases
+    # "Shipment information sent to FedEx" ALWAYS means Label Created
+    if "shipment information sent" in desc_lower:
         return "Label Created"
-
-    # Picked Up
-    if any(x in desc_lower for x in ["picked up", "pickup", "package received"]):
-        return "Picked Up"
+    if "label created" in desc_lower or "shipping label" in desc_lower:
+        return "Label Created"
 
     # Delivered
     if "delivered" in desc_lower:
         return "Delivered"
 
     # Out for Delivery
-    if "out for delivery" in desc_lower or "on fedex vehicle" in desc_lower:
+    if "out for delivery" in desc_lower or "on fedex vehicle for delivery" in desc_lower:
         return "Out for Delivery"
 
+    # Picked Up
+    if "picked up" in desc_lower or "package received" in desc_lower:
+        return "Picked Up"
+
     # In Transit variations
-    if any(x in desc_lower for x in ["in transit", "transit", "departed", "arrived", "at fedex",
-                                      "left fedex", "at local", "at destination", "on the way",
-                                      "sorting", "processed", "hub"]):
+    if any(x in desc_lower for x in ["in transit", "departed", "arrived", "left fedex",
+                                      "at fedex", "on the way", "at destination sort",
+                                      "at local fedex", "in fedex", "international shipment release"]):
         return "In Transit"
 
-    # Exception
-    if any(x in desc_lower for x in ["exception", "problem", "issue", "unable"]):
-        return "Exception"
-
-    # Hold
-    if "hold" in desc_lower:
-        return "On Hold"
-
-    # Customs/Clearance
+    # Clearance/Customs
     if any(x in desc_lower for x in ["clearance", "customs", "import", "broker"]):
         return "In Customs"
+
+    # Exception
+    if "exception" in desc_lower:
+        return "Exception"
 
     # Delay
     if "delay" in desc_lower:
         return "Delayed"
 
+    # Hold
+    if "hold" in desc_lower:
+        return "On Hold"
+
     # Delivery Attempted
-    if "attempt" in desc_lower:
+    if "delivery attempt" in desc_lower or "unable to deliver" in desc_lower:
         return "Delivery Attempted"
 
     # Return
     if "return" in desc_lower:
         return "Returned to Sender"
 
-    # If nothing matches, return description truncated or Unknown
+    # PRIORITY 2: If no description match, check status code
+    status_mapping = {
+        "DL": "Delivered",
+        "OD": "Out for Delivery",
+        "PU": "Picked Up",
+        "IT": "In Transit",
+        "AA": "In Transit",
+        "AR": "In Transit",
+        "DP": "In Transit",
+        "AF": "In Transit",
+        "PM": "In Transit",
+        "DE": "Exception",
+        "SE": "Exception",
+        "OC": "Exception",
+        "HL": "On Hold",
+        "RS": "Returned to Sender",
+        "CA": "Cancelled",
+        "CD": "In Customs",
+        "IN": "Label Created",
+        "SP": "Label Created",
+        "PL": "Label Created"
+    }
+
+    if status_code:
+        code_upper = status_code.upper()
+        if code_upper in status_mapping:
+            return status_mapping[code_upper]
+
     return description[:30] if description else "Unknown"
+
 
 def calculate_working_days(start_date, end_date):
     working_days = 0
@@ -193,7 +194,7 @@ def generate_sonia_analysis(track_data, status, is_delivered, delivery_date, shi
                 if days_since_label > 5:
                     recommendation = f"ATENCION: {days_since_label} dias desde que se creo la etiqueta. Contactar al remitente."
                 elif days_since_label > 2:
-                    recommendation = "Etiqueta creada pero aun no recogida."
+                    recommendation = "Etiqueta creada pero aun no recogida. Verificar con remitente."
                 else:
                     recommendation = "Recien creada. Esperando recogida de FedEx."
             except:
@@ -218,16 +219,34 @@ def generate_sonia_analysis(track_data, status, is_delivered, delivery_date, shi
     elif "out for delivery" in status.lower():
         recommendation = "Paquete en camino para entrega hoy!"
     elif "exception" in status.lower() or "hold" in status.lower():
-        recommendation = "ACCION REQUERIDA: Paquete tiene una excepcion."
+        recommendation = "ACCION REQUERIDA: Paquete tiene una excepcion. Contactar FedEx."
     elif "customs" in status.lower() or "clearance" in status.lower():
-        recommendation = "Paquete en proceso de aduana."
+        recommendation = "Paquete en proceso de aduana. Puede tomar varios dias."
+    elif "delayed" in status.lower():
+        recommendation = "ATENCION: Paquete retrasado. Monitorear de cerca."
     else:
         recommendation = "Monitorear envio para actualizaciones."
 
     return history_summary, recommendation
 
+
 def parse_tracking_response(response, tracking_number):
-    result = {"tracking_number": tracking_number, "sonia_status": "Unknown", "fedex_status": "", "history_summary": "", "sonia_recommendation": "", "label_creation_date": "", "ship_date": "", "delivery_date": "", "days_after_shipment": 0, "working_days_after_shipment": 0, "days_after_label_creation": 0, "destination_location": "", "is_delivered": False}
+    result = {
+        "tracking_number": tracking_number,
+        "sonia_status": "Unknown",
+        "fedex_status": "",
+        "history_summary": "",
+        "sonia_recommendation": "",
+        "label_creation_date": "",
+        "ship_date": "",
+        "delivery_date": "",
+        "days_after_shipment": 0,
+        "working_days_after_shipment": 0,
+        "days_after_label_creation": 0,
+        "destination_location": "",
+        "is_delivered": False
+    }
+
     try:
         if response and "output" in response:
             complete_track = response["output"].get("completeTrackResults", [])
@@ -239,12 +258,13 @@ def parse_tracking_response(response, tracking_number):
                     status_code = latest_status.get("code", "")
                     status_desc = latest_status.get("description", "")
 
-                    # SonIA status = normalized value
+                    # SonIA status = normalized value (check description FIRST)
                     result["sonia_status"] = get_short_status(status_code, status_desc)
                     # FedEx status = original description from API
                     result["fedex_status"] = status_desc if status_desc else status_code
                     result["is_delivered"] = "delivered" in result["sonia_status"].lower()
 
+                    # Get dates from dateAndTimes
                     date_times = track_data.get("dateAndTimes", [])
                     for dt in date_times:
                         dt_type = dt.get("type", "")
@@ -253,13 +273,32 @@ def parse_tracking_response(response, tracking_number):
                             date_only = dt_value[:10]
                             if dt_type == "ACTUAL_PICKUP" or dt_type == "SHIP":
                                 result["ship_date"] = date_only
-                            elif dt_type == "ACTUAL_TENDER" or dt_type == "LABEL":
-                                if not result["label_creation_date"]:
-                                    result["label_creation_date"] = date_only
                             elif dt_type == "ACTUAL_DELIVERY":
                                 result["delivery_date"] = date_only
                                 result["is_delivered"] = True
 
+                    # Get Label Creation Date from scan events
+                    # Look for "Shipment information sent to FedEx" event
+                    scan_events = track_data.get("scanEvents", [])
+                    for event in reversed(scan_events):  # Start from oldest event
+                        event_desc = event.get("eventDescription", "").lower()
+                        event_date = event.get("date", "")
+                        if event_date and ("shipment information sent" in event_desc or
+                                          "label created" in event_desc or
+                                          "shipping label" in event_desc):
+                            result["label_creation_date"] = event_date[:10]
+                            break
+
+                    # Get Ship Date (Picked Up) from scan events if not found
+                    if not result["ship_date"]:
+                        for event in reversed(scan_events):
+                            event_desc = event.get("eventDescription", "").lower()
+                            event_date = event.get("date", "")
+                            if event_date and ("picked up" in event_desc or "package received" in event_desc):
+                                result["ship_date"] = event_date[:10]
+                                break
+
+                    # Destination
                     dest = track_data.get("recipientInformation", {}).get("address", {})
                     if not dest:
                         dest = track_data.get("destinationLocation", {}).get("locationContactAndAddress", {}).get("address", {})
@@ -270,7 +309,9 @@ def parse_tracking_response(response, tracking_number):
                         parts = [p for p in [city, state, country] if p]
                         result["destination_location"] = ", ".join(parts)
 
+                    # Calculate days
                     today = datetime.now()
+
                     if result["ship_date"]:
                         try:
                             ship_dt = datetime.strptime(result["ship_date"], "%Y-%m-%d")
@@ -297,12 +338,17 @@ def parse_tracking_response(response, tracking_number):
                         except Exception as e:
                             logger.error(f"Error calculating label days: {e}")
 
-                    history, recommendation = generate_sonia_analysis(track_data, result["sonia_status"], result["is_delivered"], result["delivery_date"], result["ship_date"], result["label_creation_date"])
+                    history, recommendation = generate_sonia_analysis(
+                        track_data, result["sonia_status"], result["is_delivered"],
+                        result["delivery_date"], result["ship_date"], result["label_creation_date"]
+                    )
                     result["history_summary"] = history
                     result["sonia_recommendation"] = recommendation
+
     except Exception as e:
         logger.error(f"Error parsing response: {e}")
         result["sonia_recommendation"] = f"Error procesando datos: {str(e)}"
+
     return result
 
 
@@ -382,6 +428,7 @@ async def home():
 </body>
 </html>
 """
+
 
 @app.post("/process")
 async def process_file(file: UploadFile = File(...)):
