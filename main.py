@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 import httpx
 import pandas as pd
 import os
@@ -8,7 +8,6 @@ from datetime import datetime, timedelta
 import base64
 import asyncio
 import logging
-import json
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -63,15 +62,24 @@ def get_short_status(status_code, description):
     if status_code in status_mapping:
         return status_mapping[status_code]
     desc_lower = description.lower() if description else ""
-    if "delivered" in desc_lower: return "Delivered"
-    elif "in transit" in desc_lower or "transit" in desc_lower: return "In Transit"
-    elif "picked up" in desc_lower or "pickup" in desc_lower: return "Picked Up"
-    elif "out for delivery" in desc_lower: return "Out for Delivery"
-    elif "label" in desc_lower and "created" in desc_lower: return "Label Created"
-    elif "exception" in desc_lower: return "Exception"
-    elif "hold" in desc_lower: return "On Hold"
-    elif "clearance" in desc_lower or "customs" in desc_lower: return "In Customs"
-    elif "departed" in desc_lower or "arrived" in desc_lower: return "In Transit"
+    if "delivered" in desc_lower:
+        return "Delivered"
+    elif "in transit" in desc_lower or "transit" in desc_lower:
+        return "In Transit"
+    elif "picked up" in desc_lower or "pickup" in desc_lower:
+        return "Picked Up"
+    elif "out for delivery" in desc_lower:
+        return "Out for Delivery"
+    elif "label" in desc_lower and "created" in desc_lower:
+        return "Label Created"
+    elif "exception" in desc_lower:
+        return "Exception"
+    elif "hold" in desc_lower:
+        return "On Hold"
+    elif "clearance" in desc_lower or "customs" in desc_lower:
+        return "In Customs"
+    elif "departed" in desc_lower or "arrived" in desc_lower:
+        return "In Transit"
     return description[:20] if description else "Unknown"
 
 def calculate_working_days(start_date, end_date):
@@ -82,7 +90,6 @@ def calculate_working_days(start_date, end_date):
             working_days += 1
         current += timedelta(days=1)
     return working_days
-
 
 def generate_sonia_analysis(track_data, status, is_delivered, delivery_date, ship_date, label_date):
     scan_events = track_data.get("scanEvents", [])
@@ -155,7 +162,6 @@ def generate_sonia_analysis(track_data, status, is_delivered, delivery_date, shi
         recommendation = "Monitorear envio para actualizaciones."
     return history_summary, recommendation
 
-
 def parse_tracking_response(response, tracking_number):
     result = {"tracking_number": tracking_number, "status": "Unknown", "history_summary": "", "sonia_recommendation": "", "label_creation_date": "", "ship_date": "", "delivery_date": "", "days_after_shipment": 0, "working_days_after_shipment": 0, "days_after_label_creation": 0, "destination_location": "", "is_delivered": False}
     try:
@@ -226,178 +232,95 @@ def parse_tracking_response(response, tracking_number):
         result["sonia_recommendation"] = f"Error procesando datos: {str(e)}"
     return result
 
-
 @app.get("/", response_class=HTMLResponse)
 async def home():
     return """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>FedEx Tracker - SonIA</title>
-        <style>
-            body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; background: #f5f5f5; }
-            .container { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-            h1 { color: #4D148C; text-align: center; }
-            .subtitle { text-align: center; color: #FF6600; margin-bottom: 30px; }
-            .upload-form { text-align: center; }
-            input[type="file"] { margin: 20px 0; padding: 10px; }
-            button { background: #4D148C; color: white; padding: 15px 40px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; }
-            button:hover { background: #3a0f6a; }
-            button:disabled { background: #ccc; cursor: not-allowed; }
-            .progress-container { display: none; margin-top: 30px; }
-            .progress-bar { width: 100%; height: 30px; background: #e0e0e0; border-radius: 15px; overflow: hidden; }
-            .progress-fill { height: 100%; background: linear-gradient(90deg, #4D148C, #FF6600); width: 0%; transition: width 0.3s ease; }
-            .progress-text { text-align: center; margin-top: 10px; font-size: 18px; font-weight: bold; color: #4D148C; }
-            .progress-detail { text-align: center; margin-top: 5px; font-size: 14px; color: #666; }
-            .result { margin-top: 20px; padding: 20px; background: #e8f5e9; border-radius: 5px; text-align: center; display: none; }
-            .error { background: #ffebee; color: #c62828; }
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <h1>FedEx Tracker</h1>
-            <p class="subtitle">SonIA - BloomsPal</p>
-            <div class="upload-form">
-                <input type="file" id="fileInput" accept=".xlsx,.xls">
-                <br>
-                <button id="processBtn" onclick="processFile()">Procesar Archivo</button>
-            </div>
-            <div class="progress-container" id="progressContainer">
-                <div class="progress-bar">
-                    <div class="progress-fill" id="progressFill"></div>
-                </div>
-                <div class="progress-text" id="progressText">0%</div>
-                <div class="progress-detail" id="progressDetail">Iniciando...</div>
-            </div>
-            <div class="result" id="result"></div>
+<!DOCTYPE html>
+<html>
+<head>
+    <title>FedEx Tracker - SonIA</title>
+    <style>
+        body { font-family: Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; background: #f5f5f5; }
+        .container { background: white; padding: 40px; border-radius: 10px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+        h1 { color: #4D148C; text-align: center; }
+        .subtitle { text-align: center; color: #FF6600; margin-bottom: 30px; }
+        .upload-form { text-align: center; }
+        input[type="file"] { margin: 20px 0; padding: 10px; }
+        button { background: #4D148C; color: white; padding: 15px 40px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; }
+        button:hover { background: #3a0f6a; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        .loading { display: none; margin-top: 20px; text-align: center; }
+        .spinner { border: 4px solid #f3f3f3; border-top: 4px solid #4D148C; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 0 auto 10px; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+        .result { margin-top: 20px; padding: 20px; background: #e8f5e9; border-radius: 5px; text-align: center; display: none; }
+        .error { background: #ffebee; color: #c62828; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>FedEx Tracker</h1>
+        <p class="subtitle">SonIA - BloomsPal</p>
+        <div class="upload-form">
+            <input type="file" id="fileInput" accept=".xlsx,.xls">
+            <br>
+            <button id="processBtn" onclick="processFile()">Procesar Archivo</button>
         </div>
-        <script>
-            async function processFile() {
-                const fileInput = document.getElementById('fileInput');
-                const progressContainer = document.getElementById('progressContainer');
-                const progressFill = document.getElementById('progressFill');
-                const progressText = document.getElementById('progressText');
-                const progressDetail = document.getElementById('progressDetail');
-                const result = document.getElementById('result');
-                const processBtn = document.getElementById('processBtn');
-                if (!fileInput.files[0]) { alert('Por favor selecciona un archivo Excel'); return; }
-                progressContainer.style.display = 'block';
-                result.style.display = 'none';
-                progressFill.style.width = '0%';
-                progressText.textContent = '0%';
-                progressDetail.textContent = 'Subiendo archivo...';
-                processBtn.disabled = true;
-                const formData = new FormData();
-                formData.append('file', fileInput.files[0]);
-                try {
-                    const response = await fetch('/process-with-progress', { method: 'POST', body: formData });
-                    const reader = response.body.getReader();
-                    const decoder = new TextDecoder();
-                    let fileData = null;
-                    while (true) {
-                        const {value, done} = await reader.read();
-                        if (done) break;
-                        const text = decoder.decode(value);
-                        const lines = text.split('\n');
-                        for (const line of lines) {
-                            if (line.startsWith('data: ')) {
-                                try {
-                                    const data = JSON.parse(line.slice(6));
-                                    if (data.type === 'progress') {
-                                        const percent = Math.round(data.percent);
-                                        progressFill.style.width = percent + '%';
-                                        progressText.textContent = percent + '%';
-                                        progressDetail.textContent = 'Procesando ' + data.current + ' de ' + data.total + ' guias...';
-                                    } else if (data.type === 'complete') {
-                                        fileData = data.file;
-                                        progressFill.style.width = '100%';
-                                        progressText.textContent = '100%';
-                                        progressDetail.textContent = 'Completado! ' + data.total + ' guias procesadas';
-                                    } else if (data.type === 'error') {
-                                        throw new Error(data.error);
-                                    }
-                                } catch (e) {}
-                            }
-                        }
-                    }
-                    if (fileData) {
-                        const link = document.createElement('a');
-                        link.href = 'data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,' + fileData;
-                        link.download = 'FedEx_Tracking_Results.xlsx';
-                        link.click();
-                        result.style.display = 'block';
-                        result.className = 'result';
-                        result.innerHTML = '<p>SonIA ha procesado tu archivo exitosamente!</p>';
-                    }
-                } catch (error) {
-                    result.style.display = 'block';
-                    result.className = 'result error';
-                    result.innerHTML = '<p>Error: ' + error.message + '</p>';
-                } finally {
-                    processBtn.disabled = false;
-                }
+        <div class="loading" id="loading">
+            <div class="spinner"></div>
+            <p>Procesando archivo... Por favor espera.</p>
+        </div>
+        <div class="result" id="result"></div>
+    </div>
+    <script>
+        async function processFile() {
+            var fileInput = document.getElementById("fileInput");
+            var loading = document.getElementById("loading");
+            var result = document.getElementById("result");
+            var processBtn = document.getElementById("processBtn");
+
+            if (!fileInput.files[0]) {
+                alert("Por favor selecciona un archivo Excel");
+                return;
             }
-        </script>
-    </body>
-    </html>
-    """
 
+            loading.style.display = "block";
+            result.style.display = "none";
+            processBtn.disabled = true;
 
-@app.post("/process-with-progress")
-async def process_file_with_progress(file: UploadFile = File(...)):
-    async def generate():
-        try:
-            contents = await file.read()
-            df = pd.read_excel(BytesIO(contents), skiprows=[0], dtype={14: str, 'HAWB': str})
-            logger.info(f"Processing file with {len(df)} rows")
-            tracking_col = None
-            client_col = None
-            for col in df.columns:
-                col_upper = str(col).upper()
-                if 'HAWB' in col_upper: tracking_col = col
-                elif 'CLIENTE' in col_upper: client_col = col
-            if tracking_col is None and len(df.columns) > 14: tracking_col = df.columns[14]
-            if client_col is None and len(df.columns) > 2: client_col = df.columns[2]
-            if tracking_col is None:
-                yield f"data: {json.dumps({'type': 'error', 'error': 'No se encontro la columna HAWB'})}\n\n"
-                return
-            valid_rows = []
-            for idx, row in df.iterrows():
-                raw_tracking = row[tracking_col] if pd.notna(row[tracking_col]) else ""
-                tracking_number = str(raw_tracking).strip()
-                if tracking_number.endswith('.0'): tracking_number = tracking_number[:-2]
-                client_name = str(row[client_col]).strip() if client_col and pd.notna(row[client_col]) else ""
-                if tracking_number and tracking_number != "nan" and tracking_number.isdigit():
-                    valid_rows.append((tracking_number, client_name))
-            total = len(valid_rows)
-            if total == 0:
-                yield f"data: {json.dumps({'type': 'error', 'error': 'No se encontraron numeros de tracking validos'})}\n\n"
-                return
-            logger.info(f"Found {total} valid tracking numbers")
-            client = FedExClient()
-            results = []
-            for i, (tracking_number, client_name) in enumerate(valid_rows):
-                percent = ((i) / total) * 100
-                yield f"data: {json.dumps({'type': 'progress', 'current': i+1, 'total': total, 'percent': percent})}\n\n"
-                logger.info(f"Processing tracking: {tracking_number} ({i+1}/{total})")
-                response = await client.track_shipment(tracking_number)
-                parsed = parse_tracking_response(response, tracking_number)
-                parsed["client_name"] = client_name
-                results.append(parsed)
-                await asyncio.sleep(0.05)
-            logger.info(f"Processed {len(results)} tracking numbers successfully")
-            output_df = pd.DataFrame(results)
-            output_df = output_df[["client_name", "tracking_number", "status", "label_creation_date", "ship_date", "days_after_shipment", "working_days_after_shipment", "days_after_label_creation", "destination_location", "history_summary", "sonia_recommendation"]]
-            output_df.columns = ["Nombre Cliente", "FEDEX Tracking", "Status", "Label Creation Date", "Shipping Date", "Days After Shipment", "Working Days After Shipment", "Days After Label Creation", "Destination City/State/Country", "Historial", "SonIA Recomendacion"]
-            output = BytesIO()
-            output_df.to_excel(output, index=False)
-            output.seek(0)
-            encoded = base64.b64encode(output.read()).decode()
-            yield f"data: {json.dumps({'type': 'complete', 'total': total, 'file': encoded})}\n\n"
-        except Exception as e:
-            logger.error(f"Error processing file: {e}")
-            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
-    return StreamingResponse(generate(), media_type="text/event-stream")
+            var formData = new FormData();
+            formData.append("file", fileInput.files[0]);
+
+            try {
+                var response = await fetch("/process", {
+                    method: "POST",
+                    body: formData
+                });
+                var data = await response.json();
+
+                if (data.success) {
+                    var link = document.createElement("a");
+                    link.href = "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + data.file;
+                    link.download = "FedEx_Tracking_Results.xlsx";
+                    link.click();
+                    result.style.display = "block";
+                    result.className = "result";
+                    result.innerHTML = "<p>SonIA ha procesado tu archivo exitosamente!</p>";
+                } else {
+                    throw new Error(data.error);
+                }
+            } catch (error) {
+                result.style.display = "block";
+                result.className = "result error";
+                result.innerHTML = "<p>Error: " + error.message + "</p>";
+            } finally {
+                loading.style.display = "none";
+                processBtn.disabled = false;
+            }
+        }
+    </script>
+</body>
+</html>
+"""
 
 @app.post("/process")
 async def process_file(file: UploadFile = File(...)):
@@ -408,10 +331,14 @@ async def process_file(file: UploadFile = File(...)):
         client_col = None
         for col in df.columns:
             col_upper = str(col).upper()
-            if 'HAWB' in col_upper: tracking_col = col
-            elif 'CLIENTE' in col_upper: client_col = col
-        if tracking_col is None and len(df.columns) > 14: tracking_col = df.columns[14]
-        if client_col is None and len(df.columns) > 2: client_col = df.columns[2]
+            if 'HAWB' in col_upper:
+                tracking_col = col
+            elif 'CLIENTE' in col_upper:
+                client_col = col
+        if tracking_col is None and len(df.columns) > 14:
+            tracking_col = df.columns[14]
+        if client_col is None and len(df.columns) > 2:
+            client_col = df.columns[2]
         if tracking_col is None:
             return JSONResponse({"success": False, "error": "No se encontro la columna HAWB"})
         client = FedExClient()
@@ -419,7 +346,8 @@ async def process_file(file: UploadFile = File(...)):
         for idx, row in df.iterrows():
             raw_tracking = row[tracking_col] if pd.notna(row[tracking_col]) else ""
             tracking_number = str(raw_tracking).strip()
-            if tracking_number.endswith('.0'): tracking_number = tracking_number[:-2]
+            if tracking_number.endswith('.0'):
+                tracking_number = tracking_number[:-2]
             client_name = str(row[client_col]).strip() if client_col and pd.notna(row[client_col]) else ""
             if tracking_number and tracking_number != "nan" and tracking_number.isdigit():
                 response = await client.track_shipment(tracking_number)
