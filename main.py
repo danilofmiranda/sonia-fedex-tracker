@@ -58,35 +58,90 @@ class FedExClient:
                 return None
 
 def get_short_status(status_code, description):
-    status_mapping = {"PU": "Picked Up", "IT": "In Transit", "DL": "Delivered", "DE": "Delivery Exception", "OD": "Out for Delivery", "HL": "Hold at Location", "SE": "Shipment Exception", "CA": "Cancelled", "RS": "Return to Shipper"}
-    if status_code in status_mapping:
-        return status_mapping[status_code]
+    """Convert FedEx status to normalized SonIA status"""
+    # Map FedEx status codes to normalized values
+    status_mapping = {
+        "PU": "Picked Up",
+        "IT": "In Transit",
+        "DL": "Delivered",
+        "DE": "Delivery Exception",
+        "OD": "Out for Delivery",
+        "HL": "Hold at Location",
+        "SE": "Shipment Exception",
+        "CA": "Cancelled",
+        "RS": "Return to Shipper",
+        "IN": "Label Created",
+        "INITIATED": "Label Created",
+        "AA": "In Transit",
+        "AR": "In Transit",
+        "DP": "In Transit",
+        "AF": "In Transit",
+        "OC": "Shipment Exception",
+        "CD": "Clearance Delay",
+        "SP": "Label Created",
+        "PL": "Label Created",
+        "PM": "In Transit"
+    }
+
+    # Check status code first
+    if status_code:
+        code_upper = status_code.upper()
+        if code_upper in status_mapping:
+            return status_mapping[code_upper]
+
+    # Check description for keywords
     desc_lower = description.lower() if description else ""
+
+    # Label Created variations
+    if any(x in desc_lower for x in ["shipment information sent", "label created", "shipping label",
+                                      "shipment information received", "electronic shipment information",
+                                      "initiated", "created"]):
+        return "Label Created"
+
+    # Picked Up
+    if any(x in desc_lower for x in ["picked up", "pickup", "package received"]):
+        return "Picked Up"
+
+    # Delivered
     if "delivered" in desc_lower:
         return "Delivered"
-    elif "in transit" in desc_lower or "transit" in desc_lower:
-        return "In Transit"
-    elif "picked up" in desc_lower or "pickup" in desc_lower:
-        return "Picked Up"
-    elif "out for delivery" in desc_lower:
+
+    # Out for Delivery
+    if "out for delivery" in desc_lower or "on fedex vehicle" in desc_lower:
         return "Out for Delivery"
-    elif "label" in desc_lower and "created" in desc_lower:
-        return "Label Created"
-    elif "exception" in desc_lower:
-        return "Exception"
-    elif "hold" in desc_lower:
-        return "On Hold"
-    elif "clearance" in desc_lower or "customs" in desc_lower:
-        return "In Customs"
-    elif "departed" in desc_lower or "arrived" in desc_lower:
+
+    # In Transit variations
+    if any(x in desc_lower for x in ["in transit", "transit", "departed", "arrived", "at fedex",
+                                      "left fedex", "at local", "at destination", "on the way",
+                                      "sorting", "processed", "hub"]):
         return "In Transit"
-    elif "delay" in desc_lower:
+
+    # Exception
+    if any(x in desc_lower for x in ["exception", "problem", "issue", "unable"]):
+        return "Exception"
+
+    # Hold
+    if "hold" in desc_lower:
+        return "On Hold"
+
+    # Customs/Clearance
+    if any(x in desc_lower for x in ["clearance", "customs", "import", "broker"]):
+        return "In Customs"
+
+    # Delay
+    if "delay" in desc_lower:
         return "Delayed"
-    elif "attempt" in desc_lower:
+
+    # Delivery Attempted
+    if "attempt" in desc_lower:
         return "Delivery Attempted"
-    elif "return" in desc_lower:
+
+    # Return
+    if "return" in desc_lower:
         return "Returned to Sender"
-    return description[:20] if description else "Unknown"
+
+    # If nothing matches, return description truncated or Unknown
+    return description[:30] if description else "Unknown"
 
 def calculate_working_days(start_date, end_date):
     working_days = 0
@@ -110,8 +165,10 @@ def generate_sonia_analysis(track_data, status, is_delivered, delivery_date, shi
             else:
                 history_parts.append(f"{event_date}: {event_desc}")
     history_summary = " -> ".join(history_parts) if history_parts else "No scan history available"
+
     recommendation = ""
     today = datetime.now()
+
     if is_delivered:
         if delivery_date and ship_date:
             try:
@@ -166,6 +223,7 @@ def generate_sonia_analysis(track_data, status, is_delivered, delivery_date, shi
         recommendation = "Paquete en proceso de aduana."
     else:
         recommendation = "Monitorear envio para actualizaciones."
+
     return history_summary, recommendation
 
 def parse_tracking_response(response, tracking_number):
@@ -180,9 +238,13 @@ def parse_tracking_response(response, tracking_number):
                     latest_status = track_data.get("latestStatusDetail", {})
                     status_code = latest_status.get("code", "")
                     status_desc = latest_status.get("description", "")
+
+                    # SonIA status = normalized value
                     result["sonia_status"] = get_short_status(status_code, status_desc)
+                    # FedEx status = original description from API
                     result["fedex_status"] = status_desc if status_desc else status_code
                     result["is_delivered"] = "delivered" in result["sonia_status"].lower()
+
                     date_times = track_data.get("dateAndTimes", [])
                     for dt in date_times:
                         dt_type = dt.get("type", "")
@@ -197,6 +259,7 @@ def parse_tracking_response(response, tracking_number):
                             elif dt_type == "ACTUAL_DELIVERY":
                                 result["delivery_date"] = date_only
                                 result["is_delivered"] = True
+
                     dest = track_data.get("recipientInformation", {}).get("address", {})
                     if not dest:
                         dest = track_data.get("destinationLocation", {}).get("locationContactAndAddress", {}).get("address", {})
@@ -206,6 +269,7 @@ def parse_tracking_response(response, tracking_number):
                         country = dest.get("countryCode", "")
                         parts = [p for p in [city, state, country] if p]
                         result["destination_location"] = ", ".join(parts)
+
                     today = datetime.now()
                     if result["ship_date"]:
                         try:
@@ -221,6 +285,7 @@ def parse_tracking_response(response, tracking_number):
                                 result["working_days_after_shipment"] = calculate_working_days(ship_dt, today)
                         except Exception as e:
                             logger.error(f"Error calculating ship days: {e}")
+
                     if result["label_creation_date"]:
                         try:
                             label_dt = datetime.strptime(result["label_creation_date"], "%Y-%m-%d")
@@ -231,6 +296,7 @@ def parse_tracking_response(response, tracking_number):
                                 result["days_after_label_creation"] = (today - label_dt).days
                         except Exception as e:
                             logger.error(f"Error calculating label days: {e}")
+
                     history, recommendation = generate_sonia_analysis(track_data, result["sonia_status"], result["is_delivered"], result["delivery_date"], result["ship_date"], result["label_creation_date"])
                     result["history_summary"] = history
                     result["sonia_recommendation"] = recommendation
@@ -238,6 +304,7 @@ def parse_tracking_response(response, tracking_number):
         logger.error(f"Error parsing response: {e}")
         result["sonia_recommendation"] = f"Error procesando datos: {str(e)}"
     return result
+
 
 @app.get("/", response_class=HTMLResponse)
 async def home():
@@ -321,6 +388,7 @@ async def process_file(file: UploadFile = File(...)):
     try:
         contents = await file.read()
         df = pd.read_excel(BytesIO(contents), skiprows=[0], dtype={14: str, 'HAWB': str})
+
         tracking_col = None
         client_col = None
         for col in df.columns:
@@ -329,12 +397,15 @@ async def process_file(file: UploadFile = File(...)):
                 tracking_col = col
             elif 'CLIENTE' in col_upper:
                 client_col = col
+
         if tracking_col is None and len(df.columns) > 14:
             tracking_col = df.columns[14]
         if client_col is None and len(df.columns) > 2:
             client_col = df.columns[2]
+
         if tracking_col is None:
             return JSONResponse({"success": False, "error": "No se encontro la columna HAWB"})
+
         client = FedExClient()
         results = []
         for idx, row in df.iterrows():
@@ -348,11 +419,14 @@ async def process_file(file: UploadFile = File(...)):
                 parsed = parse_tracking_response(response, tracking_number)
                 parsed["client_name"] = client_name
                 results.append(parsed)
+
         if not results:
             return JSONResponse({"success": False, "error": "No se encontraron numeros de tracking validos"})
+
         output_df = pd.DataFrame(results)
         output_df = output_df[["client_name", "tracking_number", "sonia_status", "fedex_status", "label_creation_date", "ship_date", "days_after_shipment", "working_days_after_shipment", "days_after_label_creation", "destination_location", "history_summary", "sonia_recommendation"]]
         output_df.columns = ["Nombre Cliente", "FEDEX Tracking", "SonIA status", "FedEx status", "Label Creation Date", "Shipping Date", "Days After Shipment", "Working Days After Shipment", "Days After Label Creation", "Destination City/State/Country", "Historial", "SonIA Recomendacion"]
+
         output = BytesIO()
         output_df.to_excel(output, index=False)
         output.seek(0)
@@ -365,3 +439,4 @@ async def process_file(file: UploadFile = File(...)):
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8080)))
+
