@@ -10,6 +10,7 @@ import asyncio
 import logging
 import json
 import uuid
+import time
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
@@ -29,38 +30,63 @@ class FedExClient:
     def __init__(self):
         self.access_token = None
         self.base_url = FEDEX_BASE_URL
+        self.request_count = 0
+        self.token_refresh_interval = 400  # Refresh token every 400 requests
 
     async def authenticate(self):
         url = f"{self.base_url}/oauth/token"
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         data = {"grant_type": "client_credentials", "client_id": FEDEX_API_KEY, "client_secret": FEDEX_SECRET_KEY}
         logger.info(f"Authenticating with FedEx at {url}")
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.post(url, headers=headers, data=data)
             logger.info(f"Auth response status: {response.status_code}")
             if response.status_code == 200:
                 self.access_token = response.json().get("access_token")
-                logger.info("Authentication successful")
+                self.request_count = 0  # Reset counter after new token
+                logger.info("Authentication successful - token refreshed")
                 return True
             else:
                 logger.error(f"Auth failed: {response.text}")
                 return False
 
-    async def track_shipment(self, tracking_number):
-        if not self.access_token:
+    async def track_shipment(self, tracking_number, retry_count=0):
+        # Refresh token every N requests to avoid expiration
+        if not self.access_token or self.request_count >= self.token_refresh_interval:
+            logger.info(f"Token refresh needed (request count: {self.request_count})")
             await self.authenticate()
+        
         url = f"{self.base_url}/track/v1/trackingnumbers"
         headers = {"Authorization": f"Bearer {self.access_token}", "Content-Type": "application/json", "X-locale": "en_US"}
         payload = {"includeDetailedScans": True, "trackingInfo": [{"trackingNumberInfo": {"trackingNumber": tracking_number}}]}
-        logger.info(f"Tracking {tracking_number} at {url}")
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, headers=headers, json=payload)
-            logger.info(f"Track response status: {response.status_code}")
-            if response.status_code == 200:
-                return response.json()
-            else:
-                logger.error(f"Track failed for {tracking_number}: {response.text}")
-                return None
+        
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(url, headers=headers, json=payload)
+                self.request_count += 1
+                
+                if response.status_code == 200:
+                    return response.json()
+                elif response.status_code == 401 and retry_count < 2:
+                    # Token expired, refresh and retry
+                    logger.info("Token expired, refreshing...")
+                    await self.authenticate()
+                    return await self.track_shipment(tracking_number, retry_count + 1)
+                elif response.status_code == 429 and retry_count < 3:
+                    # Rate limited, wait and retry
+                    wait_time = (retry_count + 1) * 2
+                    logger.warning(f"Rate limited, waiting {wait_time}s before retry...")
+                    await asyncio.sleep(wait_time)
+                    return await self.track_shipment(tracking_number, retry_count + 1)
+                else:
+                    logger.error(f"Track failed for {tracking_number}: {response.status_code} - {response.text[:200]}")
+                    return None
+        except Exception as e:
+            logger.error(f"Exception tracking {tracking_number}: {str(e)}")
+            if retry_count < 2:
+                await asyncio.sleep(1)
+                return await self.track_shipment(tracking_number, retry_count + 1)
+            return None
 
 def get_short_status(status_code, description):
     """
@@ -70,82 +96,46 @@ def get_short_status(status_code, description):
     desc_lower = description.lower() if description else ""
 
     # PRIORITY 1: Check description first for specific phrases
-    # "Shipment information sent to FedEx" ALWAYS means Label Created
     if "shipment information sent" in desc_lower:
         return "Label Created"
     if "label created" in desc_lower or "shipping label" in desc_lower:
         return "Label Created"
-
-    # Delivered
     if "delivered" in desc_lower:
         return "Delivered"
-
-    # Out for Delivery
     if "out for delivery" in desc_lower or "on fedex vehicle for delivery" in desc_lower:
         return "Out for Delivery"
-
-    # Picked Up
     if "picked up" in desc_lower or "package received" in desc_lower:
         return "Picked Up"
-
-    # In Transit variations
     if any(x in desc_lower for x in ["in transit", "departed", "arrived", "left fedex",
                                       "at fedex", "on the way", "at destination sort",
                                       "at local fedex", "in fedex", "international shipment release"]):
         return "In Transit"
-
-    # Clearance/Customs
     if any(x in desc_lower for x in ["clearance", "customs", "import", "broker"]):
         return "In Customs"
-
-    # Exception
     if "exception" in desc_lower:
         return "Exception"
-
-    # Delay
     if "delay" in desc_lower:
         return "Delayed"
-
-    # Hold
     if "hold" in desc_lower:
         return "On Hold"
-
-    # Delivery Attempted
     if "delivery attempt" in desc_lower or "unable to deliver" in desc_lower:
         return "Delivery Attempted"
-
-    # Return
     if "return" in desc_lower:
         return "Returned to Sender"
 
     # PRIORITY 2: If no description match, check status code
     status_mapping = {
-        "DL": "Delivered",
-        "OD": "Out for Delivery",
-        "PU": "Picked Up",
-        "IT": "In Transit",
-        "AA": "In Transit",
-        "AR": "In Transit",
-        "DP": "In Transit",
-        "AF": "In Transit",
-        "PM": "In Transit",
-        "DE": "Exception",
-        "SE": "Exception",
-        "OC": "Exception",
-        "HL": "On Hold",
-        "RS": "Returned to Sender",
-        "CA": "Cancelled",
-        "CD": "In Customs",
-        "IN": "Label Created",
-        "SP": "Label Created",
-        "PL": "Label Created"
+        "DL": "Delivered", "OD": "Out for Delivery", "PU": "Picked Up",
+        "IT": "In Transit", "AA": "In Transit", "AR": "In Transit",
+        "DP": "In Transit", "AF": "In Transit", "PM": "In Transit",
+        "DE": "Exception", "SE": "Exception", "OC": "Exception",
+        "HL": "On Hold", "RS": "Returned to Sender", "CA": "Cancelled",
+        "CD": "In Customs", "IN": "Label Created", "SP": "Label Created", "PL": "Label Created"
     }
-
     if status_code:
         code_upper = status_code.upper()
         if code_upper in status_mapping:
             return status_mapping[code_upper]
-
     return description[:30] if description else "Unknown"
 
 def calculate_working_days(start_date, end_date):
@@ -261,13 +251,10 @@ def parse_tracking_response(response, tracking_number):
                     status_code = latest_status.get("code", "")
                     status_desc = latest_status.get("description", "")
 
-                    # SonIA status = normalized value (check description FIRST)
                     result["sonia_status"] = get_short_status(status_code, status_desc)
-                    # FedEx status = original description from API
                     result["fedex_status"] = status_desc if status_desc else status_code
                     result["is_delivered"] = "delivered" in result["sonia_status"].lower()
 
-                    # Get dates from dateAndTimes
                     date_times = track_data.get("dateAndTimes", [])
                     for dt in date_times:
                         dt_type = dt.get("type", "")
@@ -280,10 +267,8 @@ def parse_tracking_response(response, tracking_number):
                                 result["delivery_date"] = date_only
                                 result["is_delivered"] = True
 
-                    # Get Label Creation Date from scan events
-                    # Look for "Shipment information sent to FedEx" event
                     scan_events = track_data.get("scanEvents", [])
-                    for event in reversed(scan_events):  # Start from oldest event
+                    for event in reversed(scan_events):
                         event_desc = event.get("eventDescription", "").lower()
                         event_date = event.get("date", "")
                         if event_date and ("shipment information sent" in event_desc or
@@ -292,7 +277,6 @@ def parse_tracking_response(response, tracking_number):
                             result["label_creation_date"] = event_date[:10]
                             break
 
-                    # Get Ship Date (Picked Up) from scan events if not found
                     if not result["ship_date"]:
                         for event in reversed(scan_events):
                             event_desc = event.get("eventDescription", "").lower()
@@ -301,7 +285,6 @@ def parse_tracking_response(response, tracking_number):
                                 result["ship_date"] = event_date[:10]
                                 break
 
-                    # Destination
                     dest = track_data.get("recipientInformation", {}).get("address", {})
                     if not dest:
                         dest = track_data.get("destinationLocation", {}).get("locationContactAndAddress", {}).get("address", {})
@@ -312,9 +295,7 @@ def parse_tracking_response(response, tracking_number):
                         parts = [p for p in [city, state, country] if p]
                         result["destination_location"] = ", ".join(parts)
 
-                    # Calculate days
                     today = datetime.now()
-
                     if result["ship_date"]:
                         try:
                             ship_dt = datetime.strptime(result["ship_date"], "%Y-%m-%d")
@@ -349,8 +330,8 @@ def parse_tracking_response(response, tracking_number):
                     result["sonia_recommendation"] = recommendation
 
     except Exception as e:
-        logger.error(f"Error parsing response: {e}")
-        result["sonia_recommendation"] = f"Error procesando datos: {str(e)}"
+        logger.error(f"Error parsing response for {tracking_number}: {e}")
+        result["sonia_recommendation"] = f"Error procesando datos"
 
     return result
 
@@ -379,6 +360,7 @@ async def home():
         .result { margin-top: 20px; padding: 20px; background: #e8f5e9; border-radius: 5px; text-align: center; display: none; }
         .error { background: #ffebee; color: #c62828; }
         .success-icon { font-size: 48px; margin-bottom: 10px; }
+        .info-note { text-align: center; color: #666; font-size: 12px; margin-top: 20px; }
     </style>
 </head>
 <body>
@@ -398,6 +380,7 @@ async def home():
             <div class="progress-details" id="progressDetails">Iniciando...</div>
         </div>
         <div class="result" id="result"></div>
+        <p class="info-note">Soporta archivos con mas de 3000 guias. Tiempo estimado: ~1 guia por segundo.</p>
     </div>
     <script>
         async function processFile() {
@@ -425,7 +408,6 @@ async def home():
             formData.append("file", fileInput.files[0]);
 
             try {
-                // Start processing and get job_id
                 var startResponse = await fetch("/start-process", { method: "POST", body: formData });
                 var startData = await startResponse.json();
 
@@ -437,10 +419,9 @@ async def home():
                 var totalGuias = startData.total;
                 progressDetails.textContent = "Procesando " + totalGuias + " guias...";
 
-                // Poll for progress
                 var completed = false;
                 while (!completed) {
-                    await new Promise(r => setTimeout(r, 500)); // Wait 500ms
+                    await new Promise(r => setTimeout(r, 1000));
 
                     var progressResponse = await fetch("/progress/" + jobId);
                     var progressData = await progressResponse.json();
@@ -459,7 +440,6 @@ async def home():
                         progressText.textContent = "100%";
                         progressDetails.textContent = "Generando Excel...";
 
-                        // Get the result file
                         var resultResponse = await fetch("/result/" + jobId);
                         var resultData = await resultResponse.json();
 
@@ -519,7 +499,6 @@ async def start_process(file: UploadFile = File(...)):
         if tracking_col is None:
             return JSONResponse({"success": False, "error": "No se encontro la columna HAWB"})
 
-        # Prepare tracking list
         tracking_list = []
         for idx, row in df.iterrows():
             raw_tracking = row[tracking_col] if pd.notna(row[tracking_col]) else ""
@@ -533,7 +512,6 @@ async def start_process(file: UploadFile = File(...)):
         if not tracking_list:
             return JSONResponse({"success": False, "error": "No se encontraron numeros de tracking validos"})
 
-        # Create job
         job_id = str(uuid.uuid4())
         jobs[job_id] = {
             "status": "processing",
@@ -545,9 +523,7 @@ async def start_process(file: UploadFile = File(...)):
             "error": None
         }
 
-        # Start background processing
         asyncio.create_task(process_tracking_job(job_id))
-
         return JSONResponse({"job_id": job_id, "total": len(tracking_list)})
 
     except Exception as e:
@@ -555,30 +531,59 @@ async def start_process(file: UploadFile = File(...)):
         return JSONResponse({"success": False, "error": str(e)})
 
 async def process_tracking_job(job_id: str):
-    """Background task to process tracking numbers"""
+    """Background task to process tracking numbers with rate limiting and error handling"""
     try:
         job = jobs[job_id]
         client = FedExClient()
         tracking_list = job["tracking_list"]
         total = len(tracking_list)
+        
+        logger.info(f"Starting job {job_id} with {total} tracking numbers")
 
         for i, item in enumerate(tracking_list):
             tracking_number = item["tracking"]
             client_name = item["client"]
 
-            response = await client.track_shipment(tracking_number)
-            parsed = parse_tracking_response(response, tracking_number)
-            parsed["client_name"] = client_name
-            job["results"].append(parsed)
+            try:
+                response = await client.track_shipment(tracking_number)
+                parsed = parse_tracking_response(response, tracking_number)
+                parsed["client_name"] = client_name
+                job["results"].append(parsed)
+            except Exception as e:
+                logger.error(f"Error processing {tracking_number}: {e}")
+                # Add error result but continue processing
+                job["results"].append({
+                    "tracking_number": tracking_number,
+                    "client_name": client_name,
+                    "sonia_status": "Error",
+                    "fedex_status": "Error al procesar",
+                    "sonia_recommendation": f"Error: {str(e)[:50]}",
+                    "history_summary": "",
+                    "label_creation_date": "",
+                    "ship_date": "",
+                    "delivery_date": "",
+                    "days_after_shipment": 0,
+                    "working_days_after_shipment": 0,
+                    "days_after_label_creation": 0,
+                    "destination_location": ""
+                })
 
             # Update progress
             job["current"] = i + 1
             job["percent"] = int(((i + 1) / total) * 100)
+            
+            # Small delay to avoid rate limiting (100ms between requests)
+            await asyncio.sleep(0.1)
+            
+            # Log progress every 100 items
+            if (i + 1) % 100 == 0:
+                logger.info(f"Job {job_id}: Processed {i + 1}/{total} ({job['percent']}%)")
 
         job["status"] = "completed"
+        logger.info(f"Job {job_id} completed successfully: {total} tracking numbers processed")
 
     except Exception as e:
-        logger.error(f"Error in job {job_id}: {e}")
+        logger.error(f"Fatal error in job {job_id}: {e}")
         jobs[job_id]["status"] = "error"
         jobs[job_id]["error"] = str(e)
 
