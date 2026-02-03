@@ -30,30 +30,43 @@ class FedExClient:
     def __init__(self):
         self.access_token = None
         self.base_url = FEDEX_BASE_URL
-        self.request_count = 0
-        self.token_refresh_interval = 400  # Refresh token every 400 requests
+        self.token_expires_at = None  # Timestamp when token expires
+        self.token_buffer = 300  # Refresh 5 minutes before expiration
+
+    def is_token_expired(self):
+        """Check if token is expired or about to expire"""
+        if not self.access_token or not self.token_expires_at:
+            return True
+        # Refresh if less than buffer seconds remaining
+        return time.time() >= (self.token_expires_at - self.token_buffer)
 
     async def authenticate(self):
         url = f"{self.base_url}/oauth/token"
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         data = {"grant_type": "client_credentials", "client_id": FEDEX_API_KEY, "client_secret": FEDEX_SECRET_KEY}
         logger.info(f"Authenticating with FedEx at {url}")
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.post(url, headers=headers, data=data)
-            logger.info(f"Auth response status: {response.status_code}")
-            if response.status_code == 200:
-                self.access_token = response.json().get("access_token")
-                self.request_count = 0  # Reset counter after new token
-                logger.info("Authentication successful - token refreshed")
-                return True
-            else:
-                logger.error(f"Auth failed: {response.text}")
-                return False
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(url, headers=headers, data=data)
+                logger.info(f"Auth response status: {response.status_code}")
+                if response.status_code == 200:
+                    token_data = response.json()
+                    self.access_token = token_data.get("access_token")
+                    expires_in = token_data.get("expires_in", 3600)  # Default 1 hour
+                    self.token_expires_at = time.time() + expires_in
+                    logger.info(f"Authentication successful - token valid for {expires_in} seconds")
+                    return True
+                else:
+                    logger.error(f"Auth failed: {response.text}")
+                    return False
+        except Exception as e:
+            logger.error(f"Auth exception: {e}")
+            return False
 
     async def track_shipment(self, tracking_number, retry_count=0):
-        # Refresh token every N requests to avoid expiration
-        if not self.access_token or self.request_count >= self.token_refresh_interval:
-            logger.info(f"Token refresh needed (request count: {self.request_count})")
+        # Check if token needs refresh based on expires_in
+        if self.is_token_expired():
+            logger.info("Token expired or about to expire, refreshing...")
             await self.authenticate()
         
         url = f"{self.base_url}/track/v1/trackingnumbers"
@@ -63,23 +76,23 @@ class FedExClient:
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(url, headers=headers, json=payload)
-                self.request_count += 1
                 
                 if response.status_code == 200:
                     return response.json()
                 elif response.status_code == 401 and retry_count < 2:
-                    # Token expired, refresh and retry
-                    logger.info("Token expired, refreshing...")
+                    # Token rejected, force refresh and retry
+                    logger.info("Got 401, forcing token refresh...")
+                    self.token_expires_at = None  # Force refresh
                     await self.authenticate()
                     return await self.track_shipment(tracking_number, retry_count + 1)
                 elif response.status_code == 429 and retry_count < 3:
-                    # Rate limited, wait and retry
+                    # Rate limited - wait and retry with exponential backoff
                     wait_time = (retry_count + 1) * 2
-                    logger.warning(f"Rate limited, waiting {wait_time}s before retry...")
+                    logger.warning(f"Rate limited (429), waiting {wait_time}s before retry...")
                     await asyncio.sleep(wait_time)
                     return await self.track_shipment(tracking_number, retry_count + 1)
                 else:
-                    logger.error(f"Track failed for {tracking_number}: {response.status_code} - {response.text[:200]}")
+                    logger.error(f"Track failed for {tracking_number}: {response.status_code}")
                     return None
         except Exception as e:
             logger.error(f"Exception tracking {tracking_number}: {str(e)}")
@@ -89,13 +102,9 @@ class FedExClient:
             return None
 
 def get_short_status(status_code, description):
-    """
-    Convert FedEx status to normalized SonIA status.
-    IMPORTANT: Check description FIRST before status code.
-    """
+    """Convert FedEx status to normalized SonIA status. Check description FIRST."""
     desc_lower = description.lower() if description else ""
 
-    # PRIORITY 1: Check description first for specific phrases
     if "shipment information sent" in desc_lower:
         return "Label Created"
     if "label created" in desc_lower or "shipping label" in desc_lower:
@@ -123,7 +132,6 @@ def get_short_status(status_code, description):
     if "return" in desc_lower:
         return "Returned to Sender"
 
-    # PRIORITY 2: If no description match, check status code
     status_mapping = {
         "DL": "Delivered", "OD": "Out for Delivery", "PU": "Picked Up",
         "IT": "In Transit", "AA": "In Transit", "AR": "In Transit",
@@ -225,21 +233,12 @@ def generate_sonia_analysis(track_data, status, is_delivered, delivery_date, shi
 
 def parse_tracking_response(response, tracking_number):
     result = {
-        "tracking_number": tracking_number,
-        "sonia_status": "Unknown",
-        "fedex_status": "",
-        "history_summary": "",
-        "sonia_recommendation": "",
-        "label_creation_date": "",
-        "ship_date": "",
-        "delivery_date": "",
-        "days_after_shipment": 0,
-        "working_days_after_shipment": 0,
-        "days_after_label_creation": 0,
-        "destination_location": "",
-        "is_delivered": False
+        "tracking_number": tracking_number, "sonia_status": "Unknown", "fedex_status": "",
+        "history_summary": "", "sonia_recommendation": "", "label_creation_date": "",
+        "ship_date": "", "delivery_date": "", "days_after_shipment": 0,
+        "working_days_after_shipment": 0, "days_after_label_creation": 0,
+        "destination_location": "", "is_delivered": False
     }
-
     try:
         if response and "output" in response:
             complete_track = response["output"].get("completeTrackResults", [])
@@ -250,7 +249,6 @@ def parse_tracking_response(response, tracking_number):
                     latest_status = track_data.get("latestStatusDetail", {})
                     status_code = latest_status.get("code", "")
                     status_desc = latest_status.get("description", "")
-
                     result["sonia_status"] = get_short_status(status_code, status_desc)
                     result["fedex_status"] = status_desc if status_desc else status_code
                     result["is_delivered"] = "delivered" in result["sonia_status"].lower()
@@ -271,9 +269,7 @@ def parse_tracking_response(response, tracking_number):
                     for event in reversed(scan_events):
                         event_desc = event.get("eventDescription", "").lower()
                         event_date = event.get("date", "")
-                        if event_date and ("shipment information sent" in event_desc or
-                                          "label created" in event_desc or
-                                          "shipping label" in event_desc):
+                        if event_date and ("shipment information sent" in event_desc or "label created" in event_desc):
                             result["label_creation_date"] = event_date[:10]
                             break
 
@@ -292,8 +288,7 @@ def parse_tracking_response(response, tracking_number):
                         city = dest.get("city", "")
                         state = dest.get("stateOrProvinceCode", "")
                         country = dest.get("countryCode", "")
-                        parts = [p for p in [city, state, country] if p]
-                        result["destination_location"] = ", ".join(parts)
+                        result["destination_location"] = ", ".join([p for p in [city, state, country] if p])
 
                     today = datetime.now()
                     if result["ship_date"]:
@@ -301,15 +296,13 @@ def parse_tracking_response(response, tracking_number):
                             ship_dt = datetime.strptime(result["ship_date"], "%Y-%m-%d")
                             if result["is_delivered"] and result["delivery_date"]:
                                 delivery_dt = datetime.strptime(result["delivery_date"], "%Y-%m-%d")
-                                days_to_deliver = (delivery_dt - ship_dt).days
-                                working_days_to_deliver = calculate_working_days(ship_dt, delivery_dt)
-                                result["days_after_shipment"] = f"ENTREGADO EN {days_to_deliver} DIAS"
-                                result["working_days_after_shipment"] = f"ENTREGADO EN {working_days_to_deliver} DIAS HABILES"
+                                days = (delivery_dt - ship_dt).days
+                                result["days_after_shipment"] = f"ENTREGADO EN {days} DIAS"
+                                result["working_days_after_shipment"] = f"ENTREGADO EN {calculate_working_days(ship_dt, delivery_dt)} DIAS HABILES"
                             else:
                                 result["days_after_shipment"] = (today - ship_dt).days
                                 result["working_days_after_shipment"] = calculate_working_days(ship_dt, today)
-                        except Exception as e:
-                            logger.error(f"Error calculating ship days: {e}")
+                        except: pass
 
                     if result["label_creation_date"]:
                         try:
@@ -319,20 +312,13 @@ def parse_tracking_response(response, tracking_number):
                                 result["days_after_label_creation"] = f"ENTREGADO EN {(delivery_dt - label_dt).days} DIAS"
                             else:
                                 result["days_after_label_creation"] = (today - label_dt).days
-                        except Exception as e:
-                            logger.error(f"Error calculating label days: {e}")
+                        except: pass
 
-                    history, recommendation = generate_sonia_analysis(
-                        track_data, result["sonia_status"], result["is_delivered"],
-                        result["delivery_date"], result["ship_date"], result["label_creation_date"]
-                    )
+                    history, recommendation = generate_sonia_analysis(track_data, result["sonia_status"], result["is_delivered"], result["delivery_date"], result["ship_date"], result["label_creation_date"])
                     result["history_summary"] = history
                     result["sonia_recommendation"] = recommendation
-
     except Exception as e:
         logger.error(f"Error parsing response for {tracking_number}: {e}")
-        result["sonia_recommendation"] = f"Error procesando datos"
-
     return result
 
 @app.get("/", response_class=HTMLResponse)
@@ -354,9 +340,9 @@ async def home():
         button:disabled { background: #ccc; cursor: not-allowed; }
         .progress-container { display: none; margin-top: 30px; }
         .progress-bar-bg { background: #e0e0e0; border-radius: 10px; height: 30px; overflow: hidden; }
-        .progress-bar { background: linear-gradient(90deg, #4D148C, #FF6600); height: 100%; width: 0%; transition: width 0.3s ease; border-radius: 10px; }
+        .progress-bar { background: linear-gradient(90deg, #4D148C, #FF6600); height: 100%; width: 0%; transition: width 0.3s ease; }
         .progress-text { text-align: center; margin-top: 10px; font-size: 18px; font-weight: bold; color: #4D148C; }
-        .progress-details { text-align: center; margin-top: 5px; color: #666; font-size: 14px; }
+        .progress-details { text-align: center; margin-top: 5px; color: #666; }
         .result { margin-top: 20px; padding: 20px; background: #e8f5e9; border-radius: 5px; text-align: center; display: none; }
         .error { background: #ffebee; color: #c62828; }
         .success-icon { font-size: 48px; margin-bottom: 10px; }
@@ -368,19 +354,16 @@ async def home():
         <h1>SonIA Tracker</h1>
         <p class="subtitle">BloomsPal - FedEx Tracking</p>
         <div class="upload-form">
-            <input type="file" id="fileInput" accept=".xlsx,.xls">
-            <br>
+            <input type="file" id="fileInput" accept=".xlsx,.xls"><br>
             <button id="processBtn" onclick="processFile()">Procesar Archivo</button>
         </div>
         <div class="progress-container" id="progressContainer">
-            <div class="progress-bar-bg">
-                <div class="progress-bar" id="progressBar"></div>
-            </div>
+            <div class="progress-bar-bg"><div class="progress-bar" id="progressBar"></div></div>
             <div class="progress-text" id="progressText">0%</div>
             <div class="progress-details" id="progressDetails">Iniciando...</div>
         </div>
         <div class="result" id="result"></div>
-        <p class="info-note">Soporta archivos con mas de 3000 guias. Tiempo estimado: ~1 guia por segundo.</p>
+        <p class="info-note">Soporta archivos con +3000 guias. Token se refresca automaticamente.</p>
     </div>
     <script>
         async function processFile() {
@@ -391,82 +374,57 @@ async def home():
             var progressDetails = document.getElementById("progressDetails");
             var result = document.getElementById("result");
             var processBtn = document.getElementById("processBtn");
-
-            if (!fileInput.files[0]) {
-                alert("Por favor selecciona un archivo Excel");
-                return;
-            }
-
+            if (!fileInput.files[0]) { alert("Por favor selecciona un archivo Excel"); return; }
             progressContainer.style.display = "block";
             result.style.display = "none";
             processBtn.disabled = true;
             progressBar.style.width = "0%";
             progressText.textContent = "0%";
             progressDetails.textContent = "Subiendo archivo...";
-
             var formData = new FormData();
             formData.append("file", fileInput.files[0]);
-
             try {
                 var startResponse = await fetch("/start-process", { method: "POST", body: formData });
                 var startData = await startResponse.json();
-
-                if (!startData.job_id) {
-                    throw new Error(startData.error || "Error al iniciar proceso");
-                }
-
+                if (!startData.job_id) { throw new Error(startData.error || "Error al iniciar"); }
                 var jobId = startData.job_id;
                 var totalGuias = startData.total;
                 progressDetails.textContent = "Procesando " + totalGuias + " guias...";
-
                 var completed = false;
                 while (!completed) {
                     await new Promise(r => setTimeout(r, 1000));
-
                     var progressResponse = await fetch("/progress/" + jobId);
                     var progressData = await progressResponse.json();
-
                     var percent = progressData.percent || 0;
                     var current = progressData.current || 0;
                     var total = progressData.total || totalGuias;
-
                     progressBar.style.width = percent + "%";
                     progressText.textContent = percent + "%";
                     progressDetails.textContent = "Procesando guia " + current + " de " + total;
-
                     if (progressData.status === "completed") {
                         completed = true;
                         progressBar.style.width = "100%";
                         progressText.textContent = "100%";
                         progressDetails.textContent = "Generando Excel...";
-
                         var resultResponse = await fetch("/result/" + jobId);
                         var resultData = await resultResponse.json();
-
                         if (resultData.success) {
                             var link = document.createElement("a");
                             link.href = "data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64," + resultData.file;
                             link.download = "SonIA_Tracking_Results.xlsx";
                             link.click();
-
                             result.style.display = "block";
                             result.className = "result";
-                            result.innerHTML = "<div class='success-icon'>✅</div><p><strong>SonIA ha procesado " + total + " guias exitosamente!</strong></p>";
-                        } else {
-                            throw new Error(resultData.error);
-                        }
-                    } else if (progressData.status === "error") {
-                        throw new Error(progressData.error || "Error procesando archivo");
-                    }
+                            result.innerHTML = "<div class='success-icon'>✅</div><p><strong>SonIA proceso " + total + " guias!</strong></p>";
+                        } else { throw new Error(resultData.error); }
+                    } else if (progressData.status === "error") { throw new Error(progressData.error || "Error"); }
                 }
             } catch (error) {
                 result.style.display = "block";
                 result.className = "result error";
                 result.innerHTML = "<p>Error: " + error.message + "</p>";
             } finally {
-                setTimeout(function() {
-                    progressContainer.style.display = "none";
-                }, 1000);
+                setTimeout(function() { progressContainer.style.display = "none"; }, 1000);
                 processBtn.disabled = false;
             }
         }
@@ -477,157 +435,91 @@ async def home():
 
 @app.post("/start-process")
 async def start_process(file: UploadFile = File(...)):
-    """Start processing and return job_id for progress tracking"""
     try:
         contents = await file.read()
         df = pd.read_excel(BytesIO(contents), skiprows=[0], dtype={14: str, 'HAWB': str})
-
         tracking_col = None
         client_col = None
         for col in df.columns:
             col_upper = str(col).upper()
-            if 'HAWB' in col_upper:
-                tracking_col = col
-            elif 'CLIENTE' in col_upper:
-                client_col = col
-
-        if tracking_col is None and len(df.columns) > 14:
-            tracking_col = df.columns[14]
-        if client_col is None and len(df.columns) > 2:
-            client_col = df.columns[2]
-
+            if 'HAWB' in col_upper: tracking_col = col
+            elif 'CLIENTE' in col_upper: client_col = col
+        if tracking_col is None and len(df.columns) > 14: tracking_col = df.columns[14]
+        if client_col is None and len(df.columns) > 2: client_col = df.columns[2]
         if tracking_col is None:
-            return JSONResponse({"success": False, "error": "No se encontro la columna HAWB"})
-
+            return JSONResponse({"success": False, "error": "No se encontro columna HAWB"})
         tracking_list = []
         for idx, row in df.iterrows():
-            raw_tracking = row[tracking_col] if pd.notna(row[tracking_col]) else ""
-            tracking_number = str(raw_tracking).strip()
-            if tracking_number.endswith('.0'):
-                tracking_number = tracking_number[:-2]
+            raw = row[tracking_col] if pd.notna(row[tracking_col]) else ""
+            tracking_number = str(raw).strip()
+            if tracking_number.endswith('.0'): tracking_number = tracking_number[:-2]
             client_name = str(row[client_col]).strip() if client_col and pd.notna(row[client_col]) else ""
             if tracking_number and tracking_number != "nan" and tracking_number.isdigit():
                 tracking_list.append({"tracking": tracking_number, "client": client_name})
-
         if not tracking_list:
-            return JSONResponse({"success": False, "error": "No se encontraron numeros de tracking validos"})
-
+            return JSONResponse({"success": False, "error": "No se encontraron trackings validos"})
         job_id = str(uuid.uuid4())
-        jobs[job_id] = {
-            "status": "processing",
-            "total": len(tracking_list),
-            "current": 0,
-            "percent": 0,
-            "tracking_list": tracking_list,
-            "results": [],
-            "error": None
-        }
-
+        jobs[job_id] = {"status": "processing", "total": len(tracking_list), "current": 0, "percent": 0, "tracking_list": tracking_list, "results": [], "error": None}
         asyncio.create_task(process_tracking_job(job_id))
         return JSONResponse({"job_id": job_id, "total": len(tracking_list)})
-
     except Exception as e:
-        logger.error(f"Error starting process: {e}")
+        logger.error(f"Error starting: {e}")
         return JSONResponse({"success": False, "error": str(e)})
 
 async def process_tracking_job(job_id: str):
-    """Background task to process tracking numbers with rate limiting and error handling"""
     try:
         job = jobs[job_id]
         client = FedExClient()
         tracking_list = job["tracking_list"]
         total = len(tracking_list)
-        
-        logger.info(f"Starting job {job_id} with {total} tracking numbers")
-
+        logger.info(f"Starting job {job_id} with {total} trackings")
         for i, item in enumerate(tracking_list):
             tracking_number = item["tracking"]
             client_name = item["client"]
-
             try:
                 response = await client.track_shipment(tracking_number)
                 parsed = parse_tracking_response(response, tracking_number)
                 parsed["client_name"] = client_name
                 job["results"].append(parsed)
             except Exception as e:
-                logger.error(f"Error processing {tracking_number}: {e}")
-                # Add error result but continue processing
-                job["results"].append({
-                    "tracking_number": tracking_number,
-                    "client_name": client_name,
-                    "sonia_status": "Error",
-                    "fedex_status": "Error al procesar",
-                    "sonia_recommendation": f"Error: {str(e)[:50]}",
-                    "history_summary": "",
-                    "label_creation_date": "",
-                    "ship_date": "",
-                    "delivery_date": "",
-                    "days_after_shipment": 0,
-                    "working_days_after_shipment": 0,
-                    "days_after_label_creation": 0,
-                    "destination_location": ""
-                })
-
-            # Update progress
+                logger.error(f"Error {tracking_number}: {e}")
+                job["results"].append({"tracking_number": tracking_number, "client_name": client_name, "sonia_status": "Error", "fedex_status": "Error", "sonia_recommendation": str(e)[:50], "history_summary": "", "label_creation_date": "", "ship_date": "", "delivery_date": "", "days_after_shipment": 0, "working_days_after_shipment": 0, "days_after_label_creation": 0, "destination_location": ""})
             job["current"] = i + 1
             job["percent"] = int(((i + 1) / total) * 100)
-            
-            # Small delay to avoid rate limiting (100ms between requests)
-            await asyncio.sleep(0.1)
-            
-            # Log progress every 100 items
-            if (i + 1) % 100 == 0:
-                logger.info(f"Job {job_id}: Processed {i + 1}/{total} ({job['percent']}%)")
-
+            await asyncio.sleep(0.05)
+            if (i + 1) % 100 == 0: logger.info(f"Job {job_id}: {i + 1}/{total}")
         job["status"] = "completed"
-        logger.info(f"Job {job_id} completed successfully: {total} tracking numbers processed")
-
+        logger.info(f"Job {job_id} completed")
     except Exception as e:
-        logger.error(f"Fatal error in job {job_id}: {e}")
+        logger.error(f"Fatal error job {job_id}: {e}")
         jobs[job_id]["status"] = "error"
         jobs[job_id]["error"] = str(e)
 
 @app.get("/progress/{job_id}")
 async def get_progress(job_id: str):
-    """Get current progress of a job"""
     if job_id not in jobs:
         return JSONResponse({"error": "Job not found"}, status_code=404)
-
     job = jobs[job_id]
-    return JSONResponse({
-        "status": job["status"],
-        "total": job["total"],
-        "current": job["current"],
-        "percent": job["percent"],
-        "error": job.get("error")
-    })
+    return JSONResponse({"status": job["status"], "total": job["total"], "current": job["current"], "percent": job["percent"], "error": job.get("error")})
 
 @app.get("/result/{job_id}")
 async def get_result(job_id: str):
-    """Get the result Excel file for a completed job"""
     if job_id not in jobs:
         return JSONResponse({"success": False, "error": "Job not found"})
-
     job = jobs[job_id]
     if job["status"] != "completed":
-        return JSONResponse({"success": False, "error": "Job not completed yet"})
-
+        return JSONResponse({"success": False, "error": "Job not completed"})
     try:
         results = job["results"]
         output_df = pd.DataFrame(results)
         output_df = output_df[["client_name", "tracking_number", "sonia_status", "fedex_status", "label_creation_date", "ship_date", "days_after_shipment", "working_days_after_shipment", "days_after_label_creation", "destination_location", "history_summary", "sonia_recommendation"]]
         output_df.columns = ["Nombre Cliente", "FEDEX Tracking", "SonIA status", "FedEx status", "Label Creation Date", "Shipping Date", "Days After Shipment", "Working Days After Shipment", "Days After Label Creation", "Destination City/State/Country", "Historial", "SonIA Recomendacion"]
-
         output = BytesIO()
         output_df.to_excel(output, index=False)
         output.seek(0)
         encoded = base64.b64encode(output.read()).decode()
-
-        # Clean up job after getting result
         del jobs[job_id]
-
         return JSONResponse({"success": True, "file": encoded})
-
     except Exception as e:
         logger.error(f"Error generating result: {e}")
         return JSONResponse({"success": False, "error": str(e)})
