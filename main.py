@@ -21,9 +21,9 @@ app = FastAPI(title="SonIA Tracker - BloomsPal")
 # Store job progress and results
 jobs = {}
 
-FEDEX_API_KEY = os.getenv("FEDEX_API_KEY")
-FEDEX_SECRET_KEY = os.getenv("FEDEX_SECRET_KEY")
-FEDEX_ACCOUNT = os.getenv("FEDEX_ACCOUNT")
+FEDEX_API_KEY = os.getenv("FEDEX_API_KEY", "l7e4ca666923294740bae8dfde52ca1f52")
+FEDEX_SECRET_KEY = os.getenv("FEDEX_SECRET_KEY", "81d7f9db60554e9b97ffa7c76075763c")
+FEDEX_ACCOUNT = os.getenv("FEDEX_ACCOUNT", "740561073")
 FEDEX_BASE_URL = os.getenv("FEDEX_BASE_URL", "https://apis.fedex.com")
 
 class FedExClient:
@@ -289,13 +289,10 @@ def parse_tracking_response(response, tracking_number):
                     status_code = latest_status.get("code", "")
                     status_desc = latest_status.get("description", "")
 
-                    # SonIA status = normalized value (check description FIRST)
                     result["sonia_status"] = get_short_status(status_code, status_desc)
-                    # FedEx status = original description from API
                     result["fedex_status"] = status_desc if status_desc else status_code
                     result["is_delivered"] = "delivered" in result["sonia_status"].lower()
 
-                    # Get dates from dateAndTimes
                     date_times = track_data.get("dateAndTimes", [])
                     for dt in date_times:
                         dt_type = dt.get("type", "")
@@ -308,10 +305,8 @@ def parse_tracking_response(response, tracking_number):
                                 result["delivery_date"] = date_only
                                 result["is_delivered"] = True
 
-                    # Get Label Creation Date from scan events
-                    # Look for "Shipment information sent to FedEx" event
                     scan_events = track_data.get("scanEvents", [])
-                    for event in reversed(scan_events):  # Start from oldest event
+                    for event in reversed(scan_events):
                         event_desc = event.get("eventDescription", "").lower()
                         event_date = event.get("date", "")
                         if event_date and ("shipment information sent" in event_desc or
@@ -320,7 +315,6 @@ def parse_tracking_response(response, tracking_number):
                             result["label_creation_date"] = event_date[:10]
                             break
 
-                    # Get Ship Date (Picked Up) from scan events if not found
                     if not result["ship_date"]:
                         for event in reversed(scan_events):
                             event_desc = event.get("eventDescription", "").lower()
@@ -329,7 +323,6 @@ def parse_tracking_response(response, tracking_number):
                                 result["ship_date"] = event_date[:10]
                                 break
 
-                    # Destination
                     dest = track_data.get("recipientInformation", {}).get("address", {})
                     if not dest:
                         dest = track_data.get("destinationLocation", {}).get("locationContactAndAddress", {}).get("address", {})
@@ -340,7 +333,6 @@ def parse_tracking_response(response, tracking_number):
                         parts = [p for p in [city, state, country] if p]
                         result["destination_location"] = ", ".join(parts)
 
-                    # Calculate days
                     today = datetime.now()
 
                     if result["ship_date"]:
@@ -393,315 +385,68 @@ async def home():
     <title>SonIA Tracker - BloomsPal</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
-            min-height: 100vh;
-            display: flex;
-            flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            padding: 20px;
-        }
-
-        .container {
-            background: white;
-            border-radius: 24px;
-            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.15);
-            padding: 48px;
-            max-width: 520px;
-            width: 100%;
-            text-align: center;
-        }
-
-        .logo-container {
-            margin-bottom: 24px;
-        }
-
-        .logo {
-            width: 120px;
-            height: 120px;
-            margin: 0 auto;
-        }
-
-        /* SonIA Robot Logo SVG */
-        .sonia-logo {
-            fill: #4361EE;
-        }
-
-        h1 {
-            font-size: 32px;
-            font-weight: 700;
-            color: #1e293b;
-            margin-bottom: 8px;
-            letter-spacing: -0.5px;
-        }
-
-        .brand-text {
-            color: #4361EE;
-        }
-
-        .subtitle {
-            color: #64748b;
-            font-size: 16px;
-            font-weight: 400;
-            margin-bottom: 32px;
-        }
-
-        .subtitle span {
-            color: #4361EE;
-            font-weight: 600;
-        }
-
-        .upload-area {
-            border: 2px dashed #cbd5e1;
-            border-radius: 16px;
-            padding: 40px 24px;
-            margin-bottom: 24px;
-            transition: all 0.3s ease;
-            cursor: pointer;
-            background: #f8fafc;
-        }
-
-        .upload-area:hover {
-            border-color: #4361EE;
-            background: #f0f4ff;
-        }
-
-        .upload-area.dragover {
-            border-color: #4361EE;
-            background: #e8edff;
-            transform: scale(1.02);
-        }
-
-        .upload-icon {
-            width: 64px;
-            height: 64px;
-            margin: 0 auto 16px;
-            color: #4361EE;
-        }
-
-        .upload-text {
-            color: #475569;
-            font-size: 16px;
-            margin-bottom: 8px;
-        }
-
-        .upload-hint {
-            color: #94a3b8;
-            font-size: 14px;
-        }
-
-        .file-name {
-            display: none;
-            background: #e8edff;
-            color: #4361EE;
-            padding: 12px 20px;
-            border-radius: 12px;
-            margin-bottom: 24px;
-            font-weight: 500;
-            font-size: 14px;
-        }
-
-        .file-name.visible {
-            display: block;
-        }
-
-        .btn-primary {
-            background: linear-gradient(135deg, #4361EE 0%, #3b52d4 100%);
-            color: white;
-            border: none;
-            padding: 16px 48px;
-            font-size: 16px;
-            font-weight: 600;
-            border-radius: 12px;
-            cursor: pointer;
-            transition: all 0.3s ease;
-            width: 100%;
-            letter-spacing: 0.3px;
-        }
-
-        .btn-primary:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 10px 20px -5px rgba(67, 97, 238, 0.4);
-        }
-
-        .btn-primary:active {
-            transform: translateY(0);
-        }
-
-        .btn-primary:disabled {
-            background: #cbd5e1;
-            cursor: not-allowed;
-            transform: none;
-            box-shadow: none;
-        }
-
-        .progress-container {
-            display: none;
-            margin-top: 32px;
-        }
-
-        .progress-container.visible {
-            display: block;
-        }
-
-        .progress-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 12px;
-        }
-
-        .progress-label {
-            font-size: 14px;
-            color: #475569;
-            font-weight: 500;
-        }
-
-        .progress-percent {
-            font-size: 24px;
-            font-weight: 700;
-            color: #4361EE;
-        }
-
-        .progress-bar-bg {
-            background: #e2e8f0;
-            border-radius: 100px;
-            height: 12px;
-            overflow: hidden;
-        }
-
-        .progress-bar {
-            background: linear-gradient(90deg, #4361EE 0%, #7c3aed 100%);
-            height: 100%;
-            width: 0%;
-            border-radius: 100px;
-            transition: width 0.4s ease;
-        }
-
-        .progress-details {
-            margin-top: 12px;
-            color: #64748b;
-            font-size: 14px;
-        }
-
-        .result {
-            display: none;
-            margin-top: 32px;
-            padding: 24px;
-            border-radius: 16px;
-            text-align: center;
-        }
-
-        .result.visible {
-            display: block;
-        }
-
-        .result.success {
-            background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%);
-            border: 1px solid #a7f3d0;
-        }
-
-        .result.error {
-            background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%);
-            border: 1px solid #fecaca;
-        }
-
-        .result-icon {
-            font-size: 48px;
-            margin-bottom: 16px;
-        }
-
-        .result-text {
-            font-size: 16px;
-            font-weight: 600;
-        }
-
-        .result.success .result-text {
-            color: #065f46;
-        }
-
-        .result.error .result-text {
-            color: #991b1b;
-        }
-
-        .footer {
-            margin-top: 24px;
-            padding-top: 24px;
-            border-top: 1px solid #e2e8f0;
-        }
-
-        .footer-text {
-            color: #94a3b8;
-            font-size: 13px;
-        }
-
-        .footer-text a {
-            color: #4361EE;
-            text-decoration: none;
-            font-weight: 500;
-        }
-
-        .footer-text a:hover {
-            text-decoration: underline;
-        }
-
-        /* Animations */
-        @keyframes pulse {
-            0%, 100% { opacity: 1; }
-            50% { opacity: 0.7; }
-        }
-
-        .processing .progress-label {
-            animation: pulse 1.5s ease-in-out infinite;
-        }
-
-        /* Mobile responsive */
-        @media (max-width: 480px) {
-            .container {
-                padding: 32px 24px;
-            }
-
-            h1 {
-                font-size: 26px;
-            }
-
-            .upload-area {
-                padding: 32px 16px;
-            }
-        }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%); min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 20px; }
+        .container { background: white; border-radius: 24px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.15); padding: 48px; max-width: 520px; width: 100%; text-align: center; }
+        .logo-container { margin-bottom: 24px; }
+        .logo { width: 120px; height: 120px; margin: 0 auto; }
+        h1 { font-size: 32px; font-weight: 700; color: #1e293b; margin-bottom: 8px; letter-spacing: -0.5px; }
+        .brand-text { color: #4361EE; }
+        .subtitle { color: #64748b; font-size: 16px; font-weight: 400; margin-bottom: 32px; }
+        .subtitle span { color: #4361EE; font-weight: 600; }
+        .upload-area { border: 2px dashed #cbd5e1; border-radius: 16px; padding: 40px 24px; margin-bottom: 24px; transition: all 0.3s ease; cursor: pointer; background: #f8fafc; }
+        .upload-area:hover { border-color: #4361EE; background: #f0f4ff; }
+        .upload-area.dragover { border-color: #4361EE; background: #e8edff; transform: scale(1.02); }
+        .upload-icon { width: 64px; height: 64px; margin: 0 auto 16px; color: #4361EE; }
+        .upload-text { color: #475569; font-size: 16px; margin-bottom: 8px; }
+        .upload-hint { color: #94a3b8; font-size: 14px; }
+        .file-name { display: none; background: #e8edff; color: #4361EE; padding: 12px 20px; border-radius: 12px; margin-bottom: 24px; font-weight: 500; font-size: 14px; }
+        .file-name.visible { display: block; }
+        .btn-primary { background: linear-gradient(135deg, #4361EE 0%, #3b52d4 100%); color: white; border: none; padding: 16px 48px; font-size: 16px; font-weight: 600; border-radius: 12px; cursor: pointer; transition: all 0.3s ease; width: 100%; letter-spacing: 0.3px; }
+        .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 10px 20px -5px rgba(67, 97, 238, 0.4); }
+        .btn-primary:active { transform: translateY(0); }
+        .btn-primary:disabled { background: #cbd5e1; cursor: not-allowed; transform: none; box-shadow: none; }
+        .progress-container { display: none; margin-top: 32px; }
+        .progress-container.visible { display: block; }
+        .progress-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+        .progress-label { font-size: 14px; color: #475569; font-weight: 500; }
+        .progress-percent { font-size: 24px; font-weight: 700; color: #4361EE; }
+        .progress-bar-bg { background: #e2e8f0; border-radius: 100px; height: 12px; overflow: hidden; }
+        .progress-bar { background: linear-gradient(90deg, #4361EE 0%, #7c3aed 100%); height: 100%; width: 0%; border-radius: 100px; transition: width 0.4s ease; }
+        .progress-details { margin-top: 12px; color: #64748b; font-size: 14px; }
+        .result { display: none; margin-top: 32px; padding: 24px; border-radius: 16px; text-align: center; }
+        .result.visible { display: block; }
+        .result.success { background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%); border: 1px solid #a7f3d0; }
+        .result.error { background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%); border: 1px solid #fecaca; }
+        .result-icon { font-size: 48px; margin-bottom: 16px; }
+        .result-text { font-size: 16px; font-weight: 600; }
+        .result.success .result-text { color: #065f46; }
+        .result.error .result-text { color: #991b1b; }
+        .footer { margin-top: 24px; padding-top: 24px; border-top: 1px solid #e2e8f0; }
+        .footer-text { color: #94a3b8; font-size: 13px; }
+        .footer-text a { color: #4361EE; text-decoration: none; font-weight: 500; }
+        .footer-text a:hover { text-decoration: underline; }
+        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
+        .processing .progress-label { animation: pulse 1.5s ease-in-out infinite; }
+        @media (max-width: 480px) { .container { padding: 32px 24px; } h1 { font-size: 26px; } .upload-area { padding: 32px 16px; } }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="logo-container">
-            <!-- SonIA Robot Logo -->
             <svg class="logo" viewBox="0 0 120 120" fill="none" xmlns="http://www.w3.org/2000/svg">
-                <!-- Robot Head -->
                 <rect x="25" y="35" width="70" height="55" rx="12" fill="#4361EE"/>
-                <!-- Robot Eyes -->
                 <circle cx="45" cy="58" r="8" fill="white"/>
                 <circle cx="75" cy="58" r="8" fill="white"/>
                 <circle cx="45" cy="58" r="4" fill="#1e293b"/>
                 <circle cx="75" cy="58" r="4" fill="#1e293b"/>
-                <!-- Robot Smile -->
                 <path d="M45 75 Q60 85 75 75" stroke="white" stroke-width="3" stroke-linecap="round" fill="none"/>
-                <!-- Antenna -->
                 <rect x="56" y="20" width="8" height="18" rx="4" fill="#4361EE"/>
                 <circle cx="60" cy="15" r="8" fill="#7c3aed"/>
-                <!-- Flower/Petal on antenna -->
                 <ellipse cx="60" cy="15" rx="5" ry="8" fill="#ec4899" transform="rotate(0 60 15)"/>
                 <ellipse cx="60" cy="15" rx="5" ry="8" fill="#f472b6" transform="rotate(60 60 15)"/>
                 <ellipse cx="60" cy="15" rx="5" ry="8" fill="#ec4899" transform="rotate(120 60 15)"/>
                 <circle cx="60" cy="15" r="4" fill="#fbbf24"/>
-                <!-- Robot Body Accent -->
                 <rect x="35" y="95" width="50" height="8" rx="4" fill="#3b52d4"/>
             </svg>
         </div>
@@ -715,7 +460,7 @@ async def home():
                 <polyline points="17 8 12 3 7 8"/>
                 <line x1="12" y1="3" x2="12" y2="15"/>
             </svg>
-            <p class="upload-text">Arrastra tu archivo Excel aquí</p>
+            <p class="upload-text">Arrastra tu archivo Excel aqui</p>
             <p class="upload-hint">o haz clic para seleccionar (.xlsx, .xls)</p>
             <input type="file" id="fileInput" accept=".xlsx,.xls" style="display: none;">
         </div>
@@ -728,7 +473,7 @@ async def home():
 
         <div class="progress-container" id="progressContainer">
             <div class="progress-header">
-                <span class="progress-label" id="progressLabel">Procesando guías...</span>
+                <span class="progress-label" id="progressLabel">Procesando guias...</span>
                 <span class="progress-percent" id="progressPercent">0%</span>
             </div>
             <div class="progress-bar-bg">
@@ -744,46 +489,22 @@ async def home():
 
         <div class="footer">
             <p class="footer-text">
-                Powered by <a href="https://bloomspal.com" target="_blank">BloomsPal</a> • FedEx Tracking API
+                Powered by <a href="https://bloomspal.com" target="_blank">BloomsPal</a> - FedEx Tracking API
             </p>
         </div>
     </div>
 
     <script>
-        // Drag and drop functionality
         var uploadArea = document.getElementById('uploadArea');
         var fileInput = document.getElementById('fileInput');
         var fileName = document.getElementById('fileName');
 
-        uploadArea.addEventListener('dragover', function(e) {
-            e.preventDefault();
-            uploadArea.classList.add('dragover');
-        });
+        uploadArea.addEventListener('dragover', function(e) { e.preventDefault(); uploadArea.classList.add('dragover'); });
+        uploadArea.addEventListener('dragleave', function(e) { e.preventDefault(); uploadArea.classList.remove('dragover'); });
+        uploadArea.addEventListener('drop', function(e) { e.preventDefault(); uploadArea.classList.remove('dragover'); if (e.dataTransfer.files.length) { fileInput.files = e.dataTransfer.files; showFileName(e.dataTransfer.files[0].name); } });
+        fileInput.addEventListener('change', function() { if (fileInput.files[0]) { showFileName(fileInput.files[0].name); } });
 
-        uploadArea.addEventListener('dragleave', function(e) {
-            e.preventDefault();
-            uploadArea.classList.remove('dragover');
-        });
-
-        uploadArea.addEventListener('drop', function(e) {
-            e.preventDefault();
-            uploadArea.classList.remove('dragover');
-            if (e.dataTransfer.files.length) {
-                fileInput.files = e.dataTransfer.files;
-                showFileName(e.dataTransfer.files[0].name);
-            }
-        });
-
-        fileInput.addEventListener('change', function() {
-            if (fileInput.files[0]) {
-                showFileName(fileInput.files[0].name);
-            }
-        });
-
-        function showFileName(name) {
-            fileName.textContent = '📄 ' + name;
-            fileName.classList.add('visible');
-        }
+        function showFileName(name) { fileName.textContent = name; fileName.classList.add('visible'); }
 
         async function processFile() {
             var fileInput = document.getElementById('fileInput');
@@ -797,10 +518,7 @@ async def home():
             var resultText = document.getElementById('resultText');
             var processBtn = document.getElementById('processBtn');
 
-            if (!fileInput.files[0]) {
-                alert('Por favor selecciona un archivo Excel');
-                return;
-            }
+            if (!fileInput.files[0]) { alert('Por favor selecciona un archivo Excel'); return; }
 
             progressContainer.classList.add('visible', 'processing');
             result.classList.remove('visible');
@@ -817,64 +535,50 @@ async def home():
                 var startResponse = await fetch('/start-process', { method: 'POST', body: formData });
                 var startData = await startResponse.json();
 
-                if (!startData.job_id) {
-                    throw new Error(startData.error || 'Error al iniciar proceso');
-                }
+                if (!startData.job_id) { throw new Error(startData.error || 'Error al iniciar proceso'); }
 
                 var jobId = startData.job_id;
                 var totalGuias = startData.total;
-                progressLabel.textContent = 'Procesando ' + totalGuias + ' guías...';
+                progressLabel.textContent = 'Procesando ' + totalGuias + ' guias...';
 
                 var completed = false;
                 while (!completed) {
                     await new Promise(r => setTimeout(r, 500));
-
                     var progressResponse = await fetch('/progress/' + jobId);
                     var progressData = await progressResponse.json();
-
                     var percent = progressData.percent || 0;
                     var current = progressData.current || 0;
                     var total = progressData.total || totalGuias;
-
                     progressBar.style.width = percent + '%';
                     progressPercent.textContent = percent + '%';
-                    progressDetails.textContent = 'Guía ' + current + ' de ' + total;
+                    progressDetails.textContent = 'Guia ' + current + ' de ' + total;
 
                     if (progressData.status === 'completed') {
                         completed = true;
                         progressBar.style.width = '100%';
                         progressPercent.textContent = '100%';
                         progressDetails.textContent = 'Generando reporte...';
-
                         var resultResponse = await fetch('/result/' + jobId);
                         var resultData = await resultResponse.json();
-
                         if (resultData.success) {
                             var link = document.createElement('a');
                             link.href = 'data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,' + resultData.file;
                             link.download = 'SonIA_Tracking_Results.xlsx';
                             link.click();
-
                             result.classList.add('visible', 'success');
                             result.classList.remove('error');
-                            resultIcon.textContent = '✅';
-                            resultText.textContent = 'SonIA procesó ' + total + ' guías exitosamente!';
-                        } else {
-                            throw new Error(resultData.error);
-                        }
-                    } else if (progressData.status === 'error') {
-                        throw new Error(progressData.error || 'Error procesando archivo');
-                    }
+                            resultIcon.textContent = 'OK';
+                            resultText.textContent = 'SonIA proceso ' + total + ' guias exitosamente!';
+                        } else { throw new Error(resultData.error); }
+                    } else if (progressData.status === 'error') { throw new Error(progressData.error || 'Error procesando archivo'); }
                 }
             } catch (error) {
                 result.classList.add('visible', 'error');
                 result.classList.remove('success');
-                resultIcon.textContent = '❌';
+                resultIcon.textContent = 'ERROR';
                 resultText.textContent = 'Error: ' + error.message;
             } finally {
-                setTimeout(function() {
-                    progressContainer.classList.remove('visible', 'processing');
-                }, 1000);
+                setTimeout(function() { progressContainer.classList.remove('visible', 'processing'); }, 1000);
                 processBtn.disabled = false;
                 processBtn.textContent = 'Procesar Archivo';
             }
@@ -884,45 +588,113 @@ async def home():
 </html>
 """
 
+def find_header_row(file_bytes):
+    """
+    Detecta automaticamente la fila de encabezado en un archivo Excel.
+    Busca la fila que contiene 'HAWB', 'TRACKING', o 'FEDEX' como indicador de header.
+    Retorna (header_row_index, dataframe) o (None, None) si no encuentra header.
+    """
+    df_raw = pd.read_excel(BytesIO(file_bytes), header=None, dtype=str, nrows=10)
+
+    header_keywords = ['HAWB', 'TRACKING', 'FEDEX TRACKING', 'GUIA', 'NUMERO DE GUIA']
+
+    for row_idx in range(min(5, len(df_raw))):
+        row_values = [str(v).upper().strip() for v in df_raw.iloc[row_idx] if pd.notna(v)]
+        for keyword in header_keywords:
+            if any(keyword in val for val in row_values):
+                df = pd.read_excel(BytesIO(file_bytes), header=row_idx, dtype=str)
+                return row_idx, df
+
+    df = pd.read_excel(BytesIO(file_bytes), dtype=str)
+    return 0, df
+
+
+def clean_tracking_number(raw_value):
+    """
+    Limpia y valida un numero de tracking.
+    Maneja: floats convertidos a string (.0), espacios, guiones.
+    Retorna el tracking limpio o None si no es valido.
+    """
+    if pd.isna(raw_value) or raw_value is None:
+        return None
+
+    tracking = str(raw_value).strip()
+
+    if tracking.endswith('.0'):
+        tracking = tracking[:-2]
+
+    tracking = tracking.replace(' ', '').replace('-', '')
+
+    if not tracking or tracking.lower() == 'nan' or len(tracking) < 10:
+        return None
+
+    if not tracking.isdigit():
+        return None
+
+    return tracking
+
+
 @app.post("/start-process")
 async def start_process(file: UploadFile = File(...)):
     """Start processing and return job_id for progress tracking"""
     try:
         contents = await file.read()
-        df = pd.read_excel(BytesIO(contents), skiprows=[0], dtype={14: str, 'HAWB': str})
+
+        if not contents:
+            return JSONResponse({"success": False, "error": "El archivo esta vacio"})
+
+        try:
+            header_row, df = find_header_row(contents)
+            logger.info(f"Header detectado en fila {header_row}, {len(df)} filas, {len(df.columns)} columnas")
+        except Exception as e:
+            logger.error(f"Error leyendo Excel: {e}")
+            return JSONResponse({"success": False, "error": f"No se pudo leer el archivo Excel: {str(e)}"})
 
         tracking_col = None
         client_col = None
         for col in df.columns:
-            col_upper = str(col).upper()
-            if 'HAWB' in col_upper:
+            col_upper = str(col).upper().strip()
+            if tracking_col is None and any(kw in col_upper for kw in ['HAWB', 'TRACKING', 'GUIA', 'FEDEX']):
                 tracking_col = col
-            elif 'CLIENTE' in col_upper:
+            if client_col is None and any(kw in col_upper for kw in ['CLIENTE', 'CLIENT', 'NOMBRE']):
                 client_col = col
 
-        if tracking_col is None and len(df.columns) > 14:
-            tracking_col = df.columns[14]
-        if client_col is None and len(df.columns) > 2:
-            client_col = df.columns[2]
+        if tracking_col is None:
+            for col in df.columns:
+                sample_values = df[col].dropna().head(5)
+                numeric_count = sum(1 for v in sample_values if clean_tracking_number(v) is not None)
+                if numeric_count >= 2:
+                    tracking_col = col
+                    logger.info(f"Columna de tracking detectada automaticamente: '{col}'")
+                    break
 
         if tracking_col is None:
-            return JSONResponse({"success": False, "error": "No se encontro la columna HAWB"})
+            return JSONResponse({"success": False, "error": "No se encontro la columna de tracking (HAWB). Verifica que tu archivo tenga una columna con numeros de guia FedEx."})
 
-        # Prepare tracking list
+        if client_col is None and len(df.columns) > 2:
+            client_col = df.columns[min(2, len(df.columns) - 1)]
+
+        logger.info(f"Columna tracking: '{tracking_col}', Columna cliente: '{client_col}'")
+
         tracking_list = []
+        skipped_count = 0
         for idx, row in df.iterrows():
-            raw_tracking = row[tracking_col] if pd.notna(row[tracking_col]) else ""
-            tracking_number = str(raw_tracking).strip()
-            if tracking_number.endswith('.0'):
-                tracking_number = tracking_number[:-2]
+            tracking_number = clean_tracking_number(row[tracking_col])
             client_name = str(row[client_col]).strip() if client_col and pd.notna(row[client_col]) else ""
-            if tracking_number and tracking_number != "nan" and tracking_number.isdigit():
+            if client_name.lower() == 'nan':
+                client_name = ""
+
+            if tracking_number:
                 tracking_list.append({"tracking": tracking_number, "client": client_name})
+            else:
+                skipped_count += 1
 
         if not tracking_list:
-            return JSONResponse({"success": False, "error": "No se encontraron numeros de tracking validos"})
+            return JSONResponse({"success": False, "error": f"No se encontraron numeros de tracking validos en la columna '{tracking_col}'. Se revisaron {len(df)} filas."})
 
-        # Create job
+        if skipped_count > 0:
+            logger.info(f"Se omitieron {skipped_count} filas sin tracking valido")
+
         job_id = str(uuid.uuid4())
         jobs[job_id] = {
             "status": "processing",
@@ -934,14 +706,15 @@ async def start_process(file: UploadFile = File(...)):
             "error": None
         }
 
-        # Start background processing
         asyncio.create_task(process_tracking_job(job_id))
 
         return JSONResponse({"job_id": job_id, "total": len(tracking_list)})
 
     except Exception as e:
         logger.error(f"Error starting process: {e}")
-        return JSONResponse({"success": False, "error": str(e)})
+        import traceback
+        traceback.print_exc()
+        return JSONResponse({"success": False, "error": f"Error procesando archivo: {str(e)}"})
 
 async def process_tracking_job(job_id: str):
     """Background task to process tracking numbers"""
@@ -960,7 +733,6 @@ async def process_tracking_job(job_id: str):
             parsed["client_name"] = client_name
             job["results"].append(parsed)
 
-            # Update progress
             job["current"] = i + 1
             job["percent"] = int(((i + 1) / total) * 100)
 
@@ -1007,7 +779,6 @@ async def get_result(job_id: str):
         output.seek(0)
         encoded = base64.b64encode(output.read()).decode()
 
-        # Clean up job after getting result
         del jobs[job_id]
 
         return JSONResponse({"success": True, "file": encoded})
