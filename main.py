@@ -32,6 +32,22 @@ class FedExClient:
         self.base_url = FEDEX_BASE_URL
         self.token_expires_at = None  # Timestamp when token expires
         self.token_buffer = 300  # Refresh 5 minutes before expiration
+        self._http_client = None  # Reusable HTTP client
+
+    async def get_http_client(self):
+        """Get or create a reusable HTTP client with connection pooling"""
+        if self._http_client is None or self._http_client.is_closed:
+            self._http_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(30.0, connect=10.0),
+                limits=httpx.Limits(max_connections=20, max_keepalive_connections=10)
+            )
+        return self._http_client
+
+    async def close(self):
+        """Close the HTTP client"""
+        if self._http_client and not self._http_client.is_closed:
+            await self._http_client.aclose()
+            self._http_client = None
 
     def is_token_expired(self):
         """Check if token is expired or about to expire"""
@@ -44,51 +60,77 @@ class FedExClient:
         headers = {"Content-Type": "application/x-www-form-urlencoded"}
         data = {"grant_type": "client_credentials", "client_id": FEDEX_API_KEY, "client_secret": FEDEX_SECRET_KEY}
         logger.info(f"Authenticating with FedEx at {url}")
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, headers=headers, data=data)
-            logger.info(f"Auth response status: {response.status_code}")
-            if response.status_code == 200:
-                token_data = response.json()
-                self.access_token = token_data.get("access_token")
-                expires_in = token_data.get("expires_in", 3600)  # Default 1 hour
-                self.token_expires_at = time.time() + expires_in
-                logger.info(f"Authentication successful, token expires in {expires_in} seconds")
-                return True
-            else:
-                logger.error(f"Auth failed: {response.text}")
-                return False
+        client = await self.get_http_client()
+        response = await client.post(url, headers=headers, data=data)
+        logger.info(f"Auth response status: {response.status_code}")
+        if response.status_code == 200:
+            token_data = response.json()
+            self.access_token = token_data.get("access_token")
+            expires_in = token_data.get("expires_in", 3600)  # Default 1 hour
+            self.token_expires_at = time.time() + expires_in
+            logger.info(f"Authentication successful, token expires in {expires_in} seconds")
+            return True
+        else:
+            logger.error(f"Auth failed: {response.text}")
+            return False
 
-    async def track_shipment(self, tracking_number):
-        # Check if token is expired or about to expire
+    async def track_shipments_batch(self, tracking_numbers, max_retries=3):
+        """
+        Track multiple shipments in a single API call (up to 30 per FedEx recommendation).
+        Returns a dict mapping tracking_number -> response data.
+        """
         if self.is_token_expired():
             logger.info("Token expired or about to expire, refreshing...")
             await self.authenticate()
 
         url = f"{self.base_url}/track/v1/trackingnumbers"
         headers = {"Authorization": f"Bearer {self.access_token}", "Content-Type": "application/json", "X-locale": "en_US"}
-        payload = {"includeDetailedScans": True, "trackingInfo": [{"trackingNumberInfo": {"trackingNumber": tracking_number}}]}
+        payload = {
+            "includeDetailedScans": True,
+            "trackingInfo": [
+                {"trackingNumberInfo": {"trackingNumber": tn}} for tn in tracking_numbers
+            ]
+        }
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, headers=headers, json=payload)
+        client = await self.get_http_client()
 
-            # Handle 401 (token expired) - refresh and retry once
-            if response.status_code == 401:
-                logger.warning("Got 401, refreshing token and retrying...")
-                await self.authenticate()
-                headers["Authorization"] = f"Bearer {self.access_token}"
+        for attempt in range(max_retries):
+            try:
                 response = await client.post(url, headers=headers, json=payload)
 
-            # Handle 429 (rate limited) - wait and retry
-            if response.status_code == 429:
-                logger.warning("Rate limited, waiting 2 seconds...")
-                await asyncio.sleep(2)
-                response = await client.post(url, headers=headers, json=payload)
+                if response.status_code == 401:
+                    logger.warning("Got 401, refreshing token and retrying...")
+                    await self.authenticate()
+                    headers["Authorization"] = f"Bearer {self.access_token}"
+                    continue
 
-            if response.status_code == 200:
-                return response.json()
-            else:
-                logger.error(f"Track failed for {tracking_number}: {response.text}")
-                return None
+                if response.status_code == 429:
+                    wait_time = (2 ** attempt) + 2  # 3s, 4s, 6s
+                    logger.warning(f"Rate limited on batch, waiting {wait_time}s (attempt {attempt + 1}/{max_retries})...")
+                    await asyncio.sleep(wait_time)
+                    continue
+
+                if response.status_code >= 500:
+                    wait_time = (2 ** attempt) + 1
+                    logger.warning(f"Server error {response.status_code}, retrying in {wait_time}s...")
+                    await asyncio.sleep(wait_time)
+                    continue
+
+                if response.status_code == 200:
+                    return response.json()
+                else:
+                    logger.error(f"Batch track failed: {response.status_code} {response.text[:300]}")
+                    return None
+
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.WriteTimeout, httpx.PoolTimeout) as e:
+                wait_time = (2 ** attempt) + 1
+                logger.warning(f"Connection error on batch: {e}. Retrying in {wait_time}s (attempt {attempt + 1}/{max_retries})...")
+                await asyncio.sleep(wait_time)
+                if attempt >= 1:
+                    await self.close()
+
+        logger.error(f"All {max_retries} retries exhausted for batch of {len(tracking_numbers)}")
+        return None
 
 def get_short_status(status_code, description):
     """
@@ -289,10 +331,13 @@ def parse_tracking_response(response, tracking_number):
                     status_code = latest_status.get("code", "")
                     status_desc = latest_status.get("description", "")
 
+                    # SonIA status = normalized value (check description FIRST)
                     result["sonia_status"] = get_short_status(status_code, status_desc)
+                    # FedEx status = original description from API
                     result["fedex_status"] = status_desc if status_desc else status_code
                     result["is_delivered"] = "delivered" in result["sonia_status"].lower()
 
+                    # Get dates from dateAndTimes
                     date_times = track_data.get("dateAndTimes", [])
                     for dt in date_times:
                         dt_type = dt.get("type", "")
@@ -305,8 +350,10 @@ def parse_tracking_response(response, tracking_number):
                                 result["delivery_date"] = date_only
                                 result["is_delivered"] = True
 
+                    # Get Label Creation Date from scan events
+                    # Look for "Shipment information sent to FedEx" event
                     scan_events = track_data.get("scanEvents", [])
-                    for event in reversed(scan_events):
+                    for event in reversed(scan_events):  # Start from oldest event
                         event_desc = event.get("eventDescription", "").lower()
                         event_date = event.get("date", "")
                         if event_date and ("shipment information sent" in event_desc or
@@ -315,6 +362,7 @@ def parse_tracking_response(response, tracking_number):
                             result["label_creation_date"] = event_date[:10]
                             break
 
+                    # Get Ship Date (Picked Up) from scan events if not found
                     if not result["ship_date"]:
                         for event in reversed(scan_events):
                             event_desc = event.get("eventDescription", "").lower()
@@ -323,6 +371,7 @@ def parse_tracking_response(response, tracking_number):
                                 result["ship_date"] = event_date[:10]
                                 break
 
+                    # Destination
                     dest = track_data.get("recipientInformation", {}).get("address", {})
                     if not dest:
                         dest = track_data.get("destinationLocation", {}).get("locationContactAndAddress", {}).get("address", {})
@@ -333,6 +382,7 @@ def parse_tracking_response(response, tracking_number):
                         parts = [p for p in [city, state, country] if p]
                         result["destination_location"] = ", ".join(parts)
 
+                    # Calculate days
                     today = datetime.now()
 
                     if result["ship_date"]:
@@ -385,68 +435,315 @@ async def home():
     <title>SonIA Tracker - BloomsPal</title>
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
     <style>
-        * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%); min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 20px; }
-        .container { background: white; border-radius: 24px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.15); padding: 48px; max-width: 520px; width: 100%; text-align: center; }
-        .logo-container { margin-bottom: 24px; }
-        .logo { width: 120px; height: 120px; margin: 0 auto; }
-        h1 { font-size: 32px; font-weight: 700; color: #1e293b; margin-bottom: 8px; letter-spacing: -0.5px; }
-        .brand-text { color: #4361EE; }
-        .subtitle { color: #64748b; font-size: 16px; font-weight: 400; margin-bottom: 32px; }
-        .subtitle span { color: #4361EE; font-weight: 600; }
-        .upload-area { border: 2px dashed #cbd5e1; border-radius: 16px; padding: 40px 24px; margin-bottom: 24px; transition: all 0.3s ease; cursor: pointer; background: #f8fafc; }
-        .upload-area:hover { border-color: #4361EE; background: #f0f4ff; }
-        .upload-area.dragover { border-color: #4361EE; background: #e8edff; transform: scale(1.02); }
-        .upload-icon { width: 64px; height: 64px; margin: 0 auto 16px; color: #4361EE; }
-        .upload-text { color: #475569; font-size: 16px; margin-bottom: 8px; }
-        .upload-hint { color: #94a3b8; font-size: 14px; }
-        .file-name { display: none; background: #e8edff; color: #4361EE; padding: 12px 20px; border-radius: 12px; margin-bottom: 24px; font-weight: 500; font-size: 14px; }
-        .file-name.visible { display: block; }
-        .btn-primary { background: linear-gradient(135deg, #4361EE 0%, #3b52d4 100%); color: white; border: none; padding: 16px 48px; font-size: 16px; font-weight: 600; border-radius: 12px; cursor: pointer; transition: all 0.3s ease; width: 100%; letter-spacing: 0.3px; }
-        .btn-primary:hover { transform: translateY(-2px); box-shadow: 0 10px 20px -5px rgba(67, 97, 238, 0.4); }
-        .btn-primary:active { transform: translateY(0); }
-        .btn-primary:disabled { background: #cbd5e1; cursor: not-allowed; transform: none; box-shadow: none; }
-        .progress-container { display: none; margin-top: 32px; }
-        .progress-container.visible { display: block; }
-        .progress-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
-        .progress-label { font-size: 14px; color: #475569; font-weight: 500; }
-        .progress-percent { font-size: 24px; font-weight: 700; color: #4361EE; }
-        .progress-bar-bg { background: #e2e8f0; border-radius: 100px; height: 12px; overflow: hidden; }
-        .progress-bar { background: linear-gradient(90deg, #4361EE 0%, #7c3aed 100%); height: 100%; width: 0%; border-radius: 100px; transition: width 0.4s ease; }
-        .progress-details { margin-top: 12px; color: #64748b; font-size: 14px; }
-        .result { display: none; margin-top: 32px; padding: 24px; border-radius: 16px; text-align: center; }
-        .result.visible { display: block; }
-        .result.success { background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%); border: 1px solid #a7f3d0; }
-        .result.error { background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%); border: 1px solid #fecaca; }
-        .result-icon { font-size: 48px; margin-bottom: 16px; }
-        .result-text { font-size: 16px; font-weight: 600; }
-        .result.success .result-text { color: #065f46; }
-        .result.error .result-text { color: #991b1b; }
-        .footer { margin-top: 24px; padding-top: 24px; border-top: 1px solid #e2e8f0; }
-        .footer-text { color: #94a3b8; font-size: 13px; }
-        .footer-text a { color: #4361EE; text-decoration: none; font-weight: 500; }
-        .footer-text a:hover { text-decoration: underline; }
-        @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.7; } }
-        .processing .progress-label { animation: pulse 1.5s ease-in-out infinite; }
-        @media (max-width: 480px) { .container { padding: 32px 24px; } h1 { font-size: 26px; } .upload-area { padding: 32px 16px; } }
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: linear-gradient(135deg, #f8fafc 0%, #e2e8f0 100%);
+            min-height: 100vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 24px;
+            box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.15);
+            padding: 48px;
+            max-width: 520px;
+            width: 100%;
+            text-align: center;
+        }
+
+        .logo-container {
+            margin-bottom: 24px;
+        }
+
+        .logo {
+            width: 120px;
+            height: 120px;
+            margin: 0 auto;
+        }
+
+        /* SonIA Robot Logo SVG */
+        .sonia-logo {
+            fill: #4361EE;
+        }
+
+        h1 {
+            font-size: 32px;
+            font-weight: 700;
+            color: #1e293b;
+            margin-bottom: 8px;
+            letter-spacing: -0.5px;
+        }
+
+        .brand-text {
+            color: #4361EE;
+        }
+
+        .subtitle {
+            color: #64748b;
+            font-size: 16px;
+            font-weight: 400;
+            margin-bottom: 32px;
+        }
+
+        .subtitle span {
+            color: #4361EE;
+            font-weight: 600;
+        }
+
+        .upload-area {
+            border: 2px dashed #cbd5e1;
+            border-radius: 16px;
+            padding: 40px 24px;
+            margin-bottom: 24px;
+            transition: all 0.3s ease;
+            cursor: pointer;
+            background: #f8fafc;
+        }
+
+        .upload-area:hover {
+            border-color: #4361EE;
+            background: #f0f4ff;
+        }
+
+        .upload-area.dragover {
+            border-color: #4361EE;
+            background: #e8edff;
+            transform: scale(1.02);
+        }
+
+        .upload-icon {
+            width: 64px;
+            height: 64px;
+            margin: 0 auto 16px;
+            color: #4361EE;
+        }
+
+        .upload-text {
+            color: #475569;
+            font-size: 16px;
+            margin-bottom: 8px;
+        }
+
+        .upload-hint {
+            color: #94a3b8;
+            font-size: 14px;
+        }
+
+        .file-name {
+            display: none;
+            background: #e8edff;
+            color: #4361EE;
+            padding: 12px 20px;
+            border-radius: 12px;
+            margin-bottom: 24px;
+            font-weight: 500;
+            font-size: 14px;
+        }
+
+        .file-name.visible {
+            display: block;
+        }
+
+        .btn-primary {
+            background: linear-gradient(135deg, #4361EE 0%, #3b52d4 100%);
+            color: white;
+            border: none;
+            padding: 16px 48px;
+            font-size: 16px;
+            font-weight: 600;
+            border-radius: 12px;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            width: 100%;
+            letter-spacing: 0.3px;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px -5px rgba(67, 97, 238, 0.4);
+        }
+
+        .btn-primary:active {
+            transform: translateY(0);
+        }
+
+        .btn-primary:disabled {
+            background: #cbd5e1;
+            cursor: not-allowed;
+            transform: none;
+            box-shadow: none;
+        }
+
+        .progress-container {
+            display: none;
+            margin-top: 32px;
+        }
+
+        .progress-container.visible {
+            display: block;
+        }
+
+        .progress-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 12px;
+        }
+
+        .progress-label {
+            font-size: 14px;
+            color: #475569;
+            font-weight: 500;
+        }
+
+        .progress-percent {
+            font-size: 24px;
+            font-weight: 700;
+            color: #4361EE;
+        }
+
+        .progress-bar-bg {
+            background: #e2e8f0;
+            border-radius: 100px;
+            height: 12px;
+            overflow: hidden;
+        }
+
+        .progress-bar {
+            background: linear-gradient(90deg, #4361EE 0%, #7c3aed 100%);
+            height: 100%;
+            width: 0%;
+            border-radius: 100px;
+            transition: width 0.4s ease;
+        }
+
+        .progress-details {
+            margin-top: 12px;
+            color: #64748b;
+            font-size: 14px;
+        }
+
+        .result {
+            display: none;
+            margin-top: 32px;
+            padding: 24px;
+            border-radius: 16px;
+            text-align: center;
+        }
+
+        .result.visible {
+            display: block;
+        }
+
+        .result.success {
+            background: linear-gradient(135deg, #ecfdf5 0%, #d1fae5 100%);
+            border: 1px solid #a7f3d0;
+        }
+
+        .result.error {
+            background: linear-gradient(135deg, #fef2f2 0%, #fee2e2 100%);
+            border: 1px solid #fecaca;
+        }
+
+        .result-icon {
+            font-size: 48px;
+            margin-bottom: 16px;
+        }
+
+        .result-text {
+            font-size: 16px;
+            font-weight: 600;
+        }
+
+        .result.success .result-text {
+            color: #065f46;
+        }
+
+        .result.error .result-text {
+            color: #991b1b;
+        }
+
+        .footer {
+            margin-top: 24px;
+            padding-top: 24px;
+            border-top: 1px solid #e2e8f0;
+        }
+
+        .footer-text {
+            color: #94a3b8;
+            font-size: 13px;
+        }
+
+        .footer-text a {
+            color: #4361EE;
+            text-decoration: none;
+            font-weight: 500;
+        }
+
+        .footer-text a:hover {
+            text-decoration: underline;
+        }
+
+        /* Animations */
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.7; }
+        }
+
+        .processing .progress-label {
+            animation: pulse 1.5s ease-in-out infinite;
+        }
+
+        /* Mobile responsive */
+        @media (max-width: 480px) {
+            .container {
+                padding: 32px 24px;
+            }
+
+            h1 {
+                font-size: 26px;
+            }
+
+            .upload-area {
+                padding: 32px 16px;
+            }
+        }
     </style>
 </head>
 <body>
     <div class="container">
         <div class="logo-container">
+            <!-- SonIA Robot Logo -->
             <svg class="logo" viewBox="0 0 120 120" fill="none" xmlns="http://www.w3.org/2000/svg">
+                <!-- Robot Head -->
                 <rect x="25" y="35" width="70" height="55" rx="12" fill="#4361EE"/>
+                <!-- Robot Eyes -->
                 <circle cx="45" cy="58" r="8" fill="white"/>
                 <circle cx="75" cy="58" r="8" fill="white"/>
                 <circle cx="45" cy="58" r="4" fill="#1e293b"/>
                 <circle cx="75" cy="58" r="4" fill="#1e293b"/>
+                <!-- Robot Smile -->
                 <path d="M45 75 Q60 85 75 75" stroke="white" stroke-width="3" stroke-linecap="round" fill="none"/>
+                <!-- Antenna -->
                 <rect x="56" y="20" width="8" height="18" rx="4" fill="#4361EE"/>
                 <circle cx="60" cy="15" r="8" fill="#7c3aed"/>
+                <!-- Flower/Petal on antenna -->
                 <ellipse cx="60" cy="15" rx="5" ry="8" fill="#ec4899" transform="rotate(0 60 15)"/>
                 <ellipse cx="60" cy="15" rx="5" ry="8" fill="#f472b6" transform="rotate(60 60 15)"/>
                 <ellipse cx="60" cy="15" rx="5" ry="8" fill="#ec4899" transform="rotate(120 60 15)"/>
                 <circle cx="60" cy="15" r="4" fill="#fbbf24"/>
+                <!-- Robot Body Accent -->
                 <rect x="35" y="95" width="50" height="8" rx="4" fill="#3b52d4"/>
             </svg>
         </div>
@@ -460,7 +757,7 @@ async def home():
                 <polyline points="17 8 12 3 7 8"/>
                 <line x1="12" y1="3" x2="12" y2="15"/>
             </svg>
-            <p class="upload-text">Arrastra tu archivo Excel aqui</p>
+            <p class="upload-text">Arrastra tu archivo Excel aquí</p>
             <p class="upload-hint">o haz clic para seleccionar (.xlsx, .xls)</p>
             <input type="file" id="fileInput" accept=".xlsx,.xls" style="display: none;">
         </div>
@@ -473,7 +770,7 @@ async def home():
 
         <div class="progress-container" id="progressContainer">
             <div class="progress-header">
-                <span class="progress-label" id="progressLabel">Procesando guias...</span>
+                <span class="progress-label" id="progressLabel">Procesando guías...</span>
                 <span class="progress-percent" id="progressPercent">0%</span>
             </div>
             <div class="progress-bar-bg">
@@ -489,22 +786,46 @@ async def home():
 
         <div class="footer">
             <p class="footer-text">
-                Powered by <a href="https://bloomspal.com" target="_blank">BloomsPal</a> - FedEx Tracking API
+                Powered by <a href="https://bloomspal.com" target="_blank">BloomsPal</a> • FedEx Tracking API
             </p>
         </div>
     </div>
 
     <script>
+        // Drag and drop functionality
         var uploadArea = document.getElementById('uploadArea');
         var fileInput = document.getElementById('fileInput');
         var fileName = document.getElementById('fileName');
 
-        uploadArea.addEventListener('dragover', function(e) { e.preventDefault(); uploadArea.classList.add('dragover'); });
-        uploadArea.addEventListener('dragleave', function(e) { e.preventDefault(); uploadArea.classList.remove('dragover'); });
-        uploadArea.addEventListener('drop', function(e) { e.preventDefault(); uploadArea.classList.remove('dragover'); if (e.dataTransfer.files.length) { fileInput.files = e.dataTransfer.files; showFileName(e.dataTransfer.files[0].name); } });
-        fileInput.addEventListener('change', function() { if (fileInput.files[0]) { showFileName(fileInput.files[0].name); } });
+        uploadArea.addEventListener('dragover', function(e) {
+            e.preventDefault();
+            uploadArea.classList.add('dragover');
+        });
 
-        function showFileName(name) { fileName.textContent = name; fileName.classList.add('visible'); }
+        uploadArea.addEventListener('dragleave', function(e) {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+        });
+
+        uploadArea.addEventListener('drop', function(e) {
+            e.preventDefault();
+            uploadArea.classList.remove('dragover');
+            if (e.dataTransfer.files.length) {
+                fileInput.files = e.dataTransfer.files;
+                showFileName(e.dataTransfer.files[0].name);
+            }
+        });
+
+        fileInput.addEventListener('change', function() {
+            if (fileInput.files[0]) {
+                showFileName(fileInput.files[0].name);
+            }
+        });
+
+        function showFileName(name) {
+            fileName.textContent = '📄 ' + name;
+            fileName.classList.add('visible');
+        }
 
         async function processFile() {
             var fileInput = document.getElementById('fileInput');
@@ -518,7 +839,10 @@ async def home():
             var resultText = document.getElementById('resultText');
             var processBtn = document.getElementById('processBtn');
 
-            if (!fileInput.files[0]) { alert('Por favor selecciona un archivo Excel'); return; }
+            if (!fileInput.files[0]) {
+                alert('Por favor selecciona un archivo Excel');
+                return;
+            }
 
             progressContainer.classList.add('visible', 'processing');
             result.classList.remove('visible');
@@ -535,50 +859,64 @@ async def home():
                 var startResponse = await fetch('/start-process', { method: 'POST', body: formData });
                 var startData = await startResponse.json();
 
-                if (!startData.job_id) { throw new Error(startData.error || 'Error al iniciar proceso'); }
+                if (!startData.job_id) {
+                    throw new Error(startData.error || 'Error al iniciar proceso');
+                }
 
                 var jobId = startData.job_id;
                 var totalGuias = startData.total;
-                progressLabel.textContent = 'Procesando ' + totalGuias + ' guias...';
+                progressLabel.textContent = 'Procesando ' + totalGuias + ' guías...';
 
                 var completed = false;
                 while (!completed) {
                     await new Promise(r => setTimeout(r, 500));
+
                     var progressResponse = await fetch('/progress/' + jobId);
                     var progressData = await progressResponse.json();
+
                     var percent = progressData.percent || 0;
                     var current = progressData.current || 0;
                     var total = progressData.total || totalGuias;
+
                     progressBar.style.width = percent + '%';
                     progressPercent.textContent = percent + '%';
-                    progressDetails.textContent = 'Guia ' + current + ' de ' + total;
+                    progressDetails.textContent = 'Guía ' + current + ' de ' + total;
 
                     if (progressData.status === 'completed') {
                         completed = true;
                         progressBar.style.width = '100%';
                         progressPercent.textContent = '100%';
                         progressDetails.textContent = 'Generando reporte...';
+
                         var resultResponse = await fetch('/result/' + jobId);
                         var resultData = await resultResponse.json();
+
                         if (resultData.success) {
                             var link = document.createElement('a');
                             link.href = 'data:application/vnd.openxmlformats-officedocument.spreadsheetml.sheet;base64,' + resultData.file;
                             link.download = 'SonIA_Tracking_Results.xlsx';
                             link.click();
+
                             result.classList.add('visible', 'success');
                             result.classList.remove('error');
-                            resultIcon.textContent = 'OK';
-                            resultText.textContent = 'SonIA proceso ' + total + ' guias exitosamente!';
-                        } else { throw new Error(resultData.error); }
-                    } else if (progressData.status === 'error') { throw new Error(progressData.error || 'Error procesando archivo'); }
+                            resultIcon.textContent = '✅';
+                            resultText.textContent = 'SonIA procesó ' + total + ' guías exitosamente!';
+                        } else {
+                            throw new Error(resultData.error);
+                        }
+                    } else if (progressData.status === 'error') {
+                        throw new Error(progressData.error || 'Error procesando archivo');
+                    }
                 }
             } catch (error) {
                 result.classList.add('visible', 'error');
                 result.classList.remove('success');
-                resultIcon.textContent = 'ERROR';
+                resultIcon.textContent = '❌';
                 resultText.textContent = 'Error: ' + error.message;
             } finally {
-                setTimeout(function() { progressContainer.classList.remove('visible', 'processing'); }, 1000);
+                setTimeout(function() {
+                    progressContainer.classList.remove('visible', 'processing');
+                }, 1000);
                 processBtn.disabled = false;
                 processBtn.textContent = 'Procesar Archivo';
             }
@@ -590,41 +928,47 @@ async def home():
 
 def find_header_row(file_bytes):
     """
-    Detecta automaticamente la fila de encabezado en un archivo Excel.
+    Detecta automáticamente la fila de encabezado en un archivo Excel.
     Busca la fila que contiene 'HAWB', 'TRACKING', o 'FEDEX' como indicador de header.
     Retorna (header_row_index, dataframe) o (None, None) si no encuentra header.
     """
+    # Leer sin header para inspeccionar todas las filas
     df_raw = pd.read_excel(BytesIO(file_bytes), header=None, dtype=str, nrows=10)
 
-    header_keywords = ['HAWB', 'TRACKING', 'FEDEX TRACKING', 'GUIA', 'NUMERO DE GUIA']
+    header_keywords = ['HAWB', 'TRACKING', 'FEDEX TRACKING', 'GUIA', 'NÚMERO DE GUÍA']
 
-    for row_idx in range(min(5, len(df_raw))):
+    for row_idx in range(min(5, len(df_raw))):  # Buscar en las primeras 5 filas
         row_values = [str(v).upper().strip() for v in df_raw.iloc[row_idx] if pd.notna(v)]
         for keyword in header_keywords:
             if any(keyword in val for val in row_values):
+                # Encontramos el header en esta fila
                 df = pd.read_excel(BytesIO(file_bytes), header=row_idx, dtype=str)
                 return row_idx, df
 
+    # Si no encontramos header con keywords, intentar la primera fila como header
     df = pd.read_excel(BytesIO(file_bytes), dtype=str)
     return 0, df
 
 
 def clean_tracking_number(raw_value):
     """
-    Limpia y valida un numero de tracking.
+    Limpia y valida un número de tracking.
     Maneja: floats convertidos a string (.0), espacios, guiones.
-    Retorna el tracking limpio o None si no es valido.
+    Retorna el tracking limpio o None si no es válido.
     """
     if pd.isna(raw_value) or raw_value is None:
         return None
 
     tracking = str(raw_value).strip()
 
+    # Remover sufijo .0 de floats convertidos a string
     if tracking.endswith('.0'):
         tracking = tracking[:-2]
 
+    # Remover espacios y guiones
     tracking = tracking.replace(' ', '').replace('-', '')
 
+    # Validar: debe ser numérico y tener al menos 10 dígitos (FedEx tracking estándar)
     if not tracking or tracking.lower() == 'nan' or len(tracking) < 10:
         return None
 
@@ -641,8 +985,9 @@ async def start_process(file: UploadFile = File(...)):
         contents = await file.read()
 
         if not contents:
-            return JSONResponse({"success": False, "error": "El archivo esta vacio"})
+            return JSONResponse({"success": False, "error": "El archivo está vacío"})
 
+        # Detectar header automáticamente
         try:
             header_row, df = find_header_row(contents)
             logger.info(f"Header detectado en fila {header_row}, {len(df)} filas, {len(df.columns)} columnas")
@@ -650,6 +995,7 @@ async def start_process(file: UploadFile = File(...)):
             logger.error(f"Error leyendo Excel: {e}")
             return JSONResponse({"success": False, "error": f"No se pudo leer el archivo Excel: {str(e)}"})
 
+        # Buscar columna de tracking por nombre
         tracking_col = None
         client_col = None
         for col in df.columns:
@@ -659,23 +1005,26 @@ async def start_process(file: UploadFile = File(...)):
             if client_col is None and any(kw in col_upper for kw in ['CLIENTE', 'CLIENT', 'NOMBRE']):
                 client_col = col
 
+        # Fallback: si no encontró por nombre, intentar columna 14 o buscar columnas con números largos
         if tracking_col is None:
+            # Buscar la primera columna que contenga valores numéricos de 10+ dígitos
             for col in df.columns:
                 sample_values = df[col].dropna().head(5)
                 numeric_count = sum(1 for v in sample_values if clean_tracking_number(v) is not None)
-                if numeric_count >= 2:
+                if numeric_count >= 2:  # Al menos 2 valores parecen tracking numbers
                     tracking_col = col
-                    logger.info(f"Columna de tracking detectada automaticamente: '{col}'")
+                    logger.info(f"Columna de tracking detectada automáticamente: '{col}'")
                     break
 
         if tracking_col is None:
-            return JSONResponse({"success": False, "error": "No se encontro la columna de tracking (HAWB). Verifica que tu archivo tenga una columna con numeros de guia FedEx."})
+            return JSONResponse({"success": False, "error": "No se encontró la columna de tracking (HAWB). Verifica que tu archivo tenga una columna con números de guía FedEx."})
 
         if client_col is None and len(df.columns) > 2:
             client_col = df.columns[min(2, len(df.columns) - 1)]
 
         logger.info(f"Columna tracking: '{tracking_col}', Columna cliente: '{client_col}'")
 
+        # Preparar lista de tracking
         tracking_list = []
         skipped_count = 0
         for idx, row in df.iterrows():
@@ -690,11 +1039,12 @@ async def start_process(file: UploadFile = File(...)):
                 skipped_count += 1
 
         if not tracking_list:
-            return JSONResponse({"success": False, "error": f"No se encontraron numeros de tracking validos en la columna '{tracking_col}'. Se revisaron {len(df)} filas."})
+            return JSONResponse({"success": False, "error": f"No se encontraron números de tracking válidos en la columna '{tracking_col}'. Se revisaron {len(df)} filas."})
 
         if skipped_count > 0:
-            logger.info(f"Se omitieron {skipped_count} filas sin tracking valido")
+            logger.info(f"Se omitieron {skipped_count} filas sin tracking válido")
 
+        # Crear job
         job_id = str(uuid.uuid4())
         jobs[job_id] = {
             "status": "processing",
@@ -706,6 +1056,7 @@ async def start_process(file: UploadFile = File(...)):
             "error": None
         }
 
+        # Iniciar procesamiento en background
         asyncio.create_task(process_tracking_job(job_id))
 
         return JSONResponse({"job_id": job_id, "total": len(tracking_list)})
@@ -716,32 +1067,98 @@ async def start_process(file: UploadFile = File(...)):
         traceback.print_exc()
         return JSONResponse({"success": False, "error": f"Error procesando archivo: {str(e)}"})
 
+def parse_batch_response(batch_response, tracking_numbers):
+    """Parse a batch response from FedEx that contains multiple tracking results"""
+    results_map = {}
+
+    if not batch_response or "output" not in batch_response:
+        return results_map
+
+    complete_track_results = batch_response["output"].get("completeTrackResults", [])
+
+    for ctr in complete_track_results:
+        tn = ctr.get("trackingNumber", "")
+        track_results = ctr.get("trackResults", [])
+        if track_results:
+            # Build a response structure that parse_tracking_response expects
+            single_response = {
+                "output": {
+                    "completeTrackResults": [{
+                        "trackResults": track_results
+                    }]
+                }
+            }
+            results_map[tn] = single_response
+
+    return results_map
+
+
 async def process_tracking_job(job_id: str):
-    """Background task to process tracking numbers"""
+    """
+    Background task to process tracking numbers using batch API calls.
+    FedEx allows up to 30 tracking numbers per request.
+    This turns 3000 individual requests into just 100 batch requests.
+    """
+    client = FedExClient()
     try:
         job = jobs[job_id]
-        client = FedExClient()
         tracking_list = job["tracking_list"]
         total = len(tracking_list)
 
-        for i, item in enumerate(tracking_list):
-            tracking_number = item["tracking"]
-            client_name = item["client"]
+        # Authenticate once before starting
+        if not await client.authenticate():
+            job["status"] = "error"
+            job["error"] = "No se pudo autenticar con FedEx API"
+            return
 
-            response = await client.track_shipment(tracking_number)
-            parsed = parse_tracking_response(response, tracking_number)
-            parsed["client_name"] = client_name
-            job["results"].append(parsed)
+        # FedEx recommends max 30 tracking numbers per request
+        BATCH_SIZE = 30
+        processed = 0
 
-            job["current"] = i + 1
-            job["percent"] = int(((i + 1) / total) * 100)
+        for batch_start in range(0, total, BATCH_SIZE):
+            batch_end = min(batch_start + BATCH_SIZE, total)
+            batch = tracking_list[batch_start:batch_end]
+
+            # Extract tracking numbers for this batch
+            batch_tracking_numbers = [item["tracking"] for item in batch]
+
+            # Single API call for up to 30 tracking numbers
+            batch_response = await client.track_shipments_batch(batch_tracking_numbers)
+
+            # Parse batch response
+            if batch_response:
+                results_map = parse_batch_response(batch_response, batch_tracking_numbers)
+            else:
+                results_map = {}
+
+            # Match results back to items with client names
+            for item in batch:
+                tn = item["tracking"]
+                single_response = results_map.get(tn, None)
+                parsed = parse_tracking_response(single_response, tn)
+                parsed["client_name"] = item["client"]
+                job["results"].append(parsed)
+
+                processed += 1
+                job["current"] = processed
+                job["percent"] = int((processed / total) * 100)
+
+            # Small pause between batch requests to respect rate limits
+            # FedEx allows 1400 per 10 seconds, but we're conservative
+            if batch_end < total:
+                await asyncio.sleep(0.5)
 
         job["status"] = "completed"
+        logger.info(f"Job {job_id} completed: {total} tracking numbers processed in {(total + BATCH_SIZE - 1) // BATCH_SIZE} API calls")
 
     except Exception as e:
         logger.error(f"Error in job {job_id}: {e}")
+        import traceback
+        traceback.print_exc()
         jobs[job_id]["status"] = "error"
         jobs[job_id]["error"] = str(e)
+    finally:
+        await client.close()
 
 @app.get("/progress/{job_id}")
 async def get_progress(job_id: str):
@@ -779,6 +1196,7 @@ async def get_result(job_id: str):
         output.seek(0)
         encoded = base64.b64encode(output.read()).decode()
 
+        # Clean up job after getting result
         del jobs[job_id]
 
         return JSONResponse({"success": True, "file": encoded})
